@@ -39,6 +39,7 @@ ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "152761435347
 SECURITY_LOGS_CHANNEL_ID = int(os.getenv("SECURITY_LOGS_CHANNEL_ID", "1568911585743863909"))
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1527614361785471006"))
 LEAVE_CHANNEL_ID = int(os.getenv("LEAVE_CHANNEL_ID", "1543366821564911616"))
+RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1527654849150193694"))
 SERVER_LINK_CHANNEL_ID = int(os.getenv("SERVER_LINK_CHANNEL_ID", "1521338694441631855"))
 PERMANENT_INVITE_URL = os.getenv("PERMANENT_INVITE_URL", "https://discord.gg/2NTFjRqemq")
 GUILD_ID = int(os.getenv("GUILD_ID", "1387608034641055785"))
@@ -754,6 +755,7 @@ class DenzerVoiceBot(discord.Client):
         self.security_logs_channel_id = SECURITY_LOGS_CHANNEL_ID
         self.welcome_channel_id = WELCOME_CHANNEL_ID
         self.leave_channel_id = LEAVE_CHANNEL_ID
+        self.rules_channel_id = RULES_CHANNEL_ID
         self.server_link_channel_id = SERVER_LINK_CHANNEL_ID
         self.permanent_invite_url = PERMANENT_INVITE_URL
         self.guild_id = GUILD_ID
@@ -1257,12 +1259,7 @@ class DenzerVoiceBot(discord.Client):
             target_pos = ann_channel.position if ann_channel else 1
 
             overwrites = {
-                guild.default_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=False,
-                    add_reactions=False,
-                    read_message_history=True
-                ),
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
                 guild.me: discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
@@ -1823,13 +1820,22 @@ class DenzerVoiceBot(discord.Client):
                     except Exception as e:
                         logger.debug(f"Aviso escaneando imagen: {e}")
 
-        # 3. CANALES EXCLUIDOS DE TTS
+        # 3. BLOQUEO DE ESCRITURA EN CANAL DE REGLAS (SOLO ADMINS/STAFF)
+        if message.channel.id == self.rules_channel_id and not is_user_staff_or_owner(message.author, message.guild):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
+        # 4. CANALES EXCLUIDOS DE TTS
         tts_excluded_channels = (
             self.ticket_channel_id,
             self.announcement_channel_id,
             self.security_logs_channel_id,
             self.welcome_channel_id,
             self.leave_channel_id,
+            self.rules_channel_id,
             self.server_link_channel_id
         )
         if message.channel.id in tts_excluded_channels:
