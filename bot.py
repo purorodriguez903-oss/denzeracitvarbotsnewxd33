@@ -5,10 +5,11 @@ import time
 import random
 import socket
 import asyncio
+import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 import unicodedata
-from typing import Optional
+from typing import Optional, Union
 from dotenv import load_dotenv
 
 # Forzar codificación UTF-8 en consolas Windows
@@ -33,8 +34,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1543395577289777202"))
 TICKET_CHANNEL_ID = int(os.getenv("TICKET_CHANNEL_ID", "1527614381314015252"))
 ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "1527614353476554762"))
+SECURITY_LOGS_CHANNEL_ID = int(os.getenv("SECURITY_LOGS_CHANNEL_ID", "1568911585743863909"))
 GUILD_ID = int(os.getenv("GUILD_ID", "1387608034641055785"))
 PORT = int(os.getenv("PORT", "8080"))
+
+# Configuración de Seguridad
+BOT_AUTH_PASSWORD = "rafaxd"
+INVITE_REGEX = re.compile(r'(?:https?:\/\/)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9\-]+)', re.IGNORECASE)
 
 # Configuración de Logging Dual (Consola + Archivo bot.log con rotación)
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
@@ -319,6 +325,22 @@ async def create_ticket_for_user(interaction: discord.Interaction, selected_prod
         )
         logger.info(f"🎫 Ticket #{ticket_channel.name} creado para {interaction.user.name} ({interaction.user.id}) | Producto: {selected_product}")
 
+        # Registrar en el canal de seguridad y logs 24/7
+        try:
+            bot_client = interaction.client
+            await bot_client.log_security_event(
+                guild=guild,
+                title="🎫 Nuevo Ticket de Compra Creado",
+                description=(
+                    f"👤 **Cliente:** {interaction.user.mention} (`{interaction.user.name}` - `{interaction.user.id}`)\n"
+                    f"🛒 **Producto solicitado:** `{selected_product}`\n"
+                    f"📁 **Canal creado:** {ticket_channel.mention} (`#{ticket_channel.name}`)"
+                ),
+                color=discord.Color.from_rgb(0, 230, 118)
+            )
+        except Exception as log_err:
+            logger.warning(f"Aviso registrando ticket en logs: {log_err}")
+
     except discord.Forbidden:
         await interaction.followup.send(
             "❌ **Error de Permisos:** El bot no tiene el permiso 'Gestionar Canales' para crear tu ticket. Contacta a un administrador.",
@@ -455,6 +477,23 @@ class TicketConfirmCloseView(discord.ui.View):
             return
 
         await interaction.response.send_message("🔒 **Cerrando ticket...** El canal se eliminará en 5 segundos.")
+        
+        # Registrar en el canal de logs 24/7
+        try:
+            bot_client = interaction.client
+            channel_name = interaction.channel.name if interaction.channel else "desconocido"
+            await bot_client.log_security_event(
+                guild=interaction.guild,
+                title="🔒 Ticket Cerrado y Eliminado",
+                description=(
+                    f"📁 **Canal:** `#{channel_name}`\n"
+                    f"👤 **Cerrado por:** {interaction.user.mention} (`{interaction.user.name}` - Staff/Owner)"
+                ),
+                color=discord.Color.dark_grey()
+            )
+        except Exception:
+            pass
+
         await asyncio.sleep(5)
         try:
             await interaction.channel.delete(reason=f"Ticket cerrado por {interaction.user.name} (Staff/Owner)")
@@ -496,7 +535,146 @@ class TicketCloseView(discord.ui.View):
 
 
 # ==========================================
-# 🤖 CLASE PRINCIPAL DEL BOT (DENZER VOICE + TICKETS + ANUNCIOS)
+# 🔐 SISTEMA DE AUTORIZACIÓN DE BOTS (ANTI-RAID CON PASSWORD)
+# ==========================================
+
+class BotAuthModal(discord.ui.Modal, title="🔐 Autorizar Bot (Owner)"):
+    password_input = discord.ui.TextInput(
+        label="Contraseña del Owner:",
+        placeholder="Ingresa la contraseña para autorizar...",
+        style=discord.TextStyle.short,
+        min_length=3,
+        max_length=50,
+        required=True
+    )
+
+    def __init__(self, bot_id: int, bot_name: str, message: Optional[discord.Message] = None):
+        super().__init__()
+        self.bot_id = bot_id
+        self.bot_name = bot_name
+        self.message = message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.password_input.value.strip().lower() == BOT_AUTH_PASSWORD.lower():
+            embed = discord.Embed(
+                title="✅ BOT AUTORIZADO POR EL OWNER",
+                description=(
+                    f"🤖 **Bot:** <@{self.bot_id}> (`{self.bot_name}` - `{self.bot_id}`)\n"
+                    f"👑 **Autorizado por:** {interaction.user.mention} (`{interaction.user.name}`)\n"
+                    f"🔑 **Verificación:** Contraseña correcta confirmada (`rafaxd`).\n"
+                    f"🛡️ **Estado:** Acceso legal permitido permanentemente."
+                ),
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_footer(text="Denzel XT • Sistema de Seguridad 24/7", icon_url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)
+
+            try:
+                if self.message:
+                    await self.message.edit(content=f"✅ **Bot {self.bot_name} verificado y autorizado.**", embed=embed, view=None)
+                elif interaction.message:
+                    await interaction.message.edit(content=f"✅ **Bot {self.bot_name} verificado y autorizado.**", embed=embed, view=None)
+            except Exception as e:
+                logger.warning(f"Aviso actualizando mensaje de auth: {e}")
+
+            await interaction.response.send_message(
+                f"✅ **¡Contraseña correcta!** El bot **{self.bot_name}** ha sido verificado y autorizado en el servidor.",
+                ephemeral=True
+            )
+            logger.info(f"✅ Bot {self.bot_name} ({self.bot_id}) autorizado con contraseña por Owner {interaction.user.name}")
+        else:
+            await interaction.response.send_message(
+                "❌ **Contraseña incorrecta.** El bot NO ha sido autorizado. Verifica con el Owner la clave.",
+                ephemeral=True
+            )
+            logger.warning(f"❌ Intento de autorización fallido para bot {self.bot_id} por {interaction.user.name} (contraseña errónea)")
+
+
+class BotVerificationView(discord.ui.View):
+    """Botones interactivos para que el Owner autorice o expulse bots nuevos."""
+    def __init__(self, bot_id: int, bot_name: str):
+        super().__init__(timeout=None)
+        self.bot_id = bot_id
+        self.bot_name = bot_name
+
+        self.btn_auth = discord.ui.Button(
+            label="Autorizar Bot",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id=f"bot_auth_verify:{bot_id}"
+        )
+        self.btn_auth.callback = self.auth_callback
+        self.add_item(self.btn_auth)
+
+        self.btn_kick = discord.ui.Button(
+            label="No reconozco el bot (Expulsar)",
+            style=discord.ButtonStyle.danger,
+            emoji="❌",
+            custom_id=f"bot_auth_kick:{bot_id}"
+        )
+        self.btn_kick.callback = self.kick_callback
+        self.add_item(self.btn_kick)
+
+    async def auth_callback(self, interaction: discord.Interaction):
+        if interaction.guild and interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message(
+                "⛔ **Acceso Denegado:** Solo el **Dueño del Servidor (Owner)** puede ingresar la contraseña para autorizar nuevos bots.",
+                ephemeral=True
+            )
+            return
+
+        modal = BotAuthModal(bot_id=self.bot_id, bot_name=self.bot_name, message=interaction.message)
+        await interaction.response.send_modal(modal)
+
+    async def kick_callback(self, interaction: discord.Interaction):
+        is_owner = (interaction.guild and interaction.user.id == interaction.guild.owner_id)
+        is_admin = interaction.user.guild_permissions.administrator
+        if not (is_owner or is_admin):
+            await interaction.response.send_message(
+                "⛔ **Acceso Denegado:** Solo el **Owner** o **Administradores** pueden expulsar bots.",
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        bot_member = guild.get_member(self.bot_id) if guild else None
+        kick_status = ""
+        if bot_member:
+            try:
+                await bot_member.kick(reason=f"Anti-Raid: Bot no reconocido expulsado por {interaction.user.name}")
+                kick_status = f"🔨 Bot **{self.bot_name}** expulsado inmediatamente."
+            except Exception as e:
+                kick_status = f"⚠️ Falló expulsión ({e})."
+        else:
+            kick_status = "⚠️ El bot ya no se encuentra en el servidor."
+
+        embed = discord.Embed(
+            title="🔨 BOT EXPULSADO DEL SERVIDOR (ANTI-RAID)",
+            description=(
+                f"🤖 **Bot:** `{self.bot_name}` (`{self.bot_id}`)\n"
+                f"👤 **Acción realizada por:** {interaction.user.mention} (`{interaction.user.name}`)\n"
+                f"🛡️ **Motivo:** Bot no reconocido por el Owner.\n"
+                f"⚡ **Resultado:** {kick_status}"
+            ),
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text="Denzel XT • Sistema Anti-Raid 24/7", icon_url=guild.icon.url if guild and guild.icon else None)
+
+        try:
+            await interaction.message.edit(content=f"🔨 **Bot {self.bot_name} rechazado y expulsado.**", embed=embed, view=None)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f"🔨 Bot **{self.bot_name}** rechazado y expulsado del servidor por seguridad.",
+            ephemeral=True
+        )
+        logger.info(f"🔨 Bot {self.bot_name} ({self.bot_id}) expulsado por {interaction.user.name}")
+
+
+# ==========================================
+# 🤖 CLASE PRINCIPAL DEL BOT (DENZER VOICE + TICKETS + ANUNCIOS + SEGURIDAD 24/7)
 # ==========================================
 
 class DenzerVoiceBot(discord.Client):
@@ -507,12 +685,16 @@ class DenzerVoiceBot(discord.Client):
         self.target_channel_id = VOICE_CHANNEL_ID
         self.ticket_channel_id = TICKET_CHANNEL_ID
         self.announcement_channel_id = ANNOUNCEMENT_CHANNEL_ID
+        self.security_logs_channel_id = SECURITY_LOGS_CHANNEL_ID
         self.guild_id = GUILD_ID
         self.connection_lock = asyncio.Lock()
         self.audio_queue = asyncio.Queue()
         self.is_playing_speech = False
         self.user_join_cooldowns = {}
         self.user_ticket_selections = {}
+        self.recent_bans = {}
+        self.recent_kicks = {}
+        self.user_message_timestamps = {}
         self.start_time = time.time()
         self.current_status_index = 0
         self.watchdog_fail_count = 0
@@ -528,8 +710,80 @@ class DenzerVoiceBot(discord.Client):
         logger.info("🧩 Vistas persistentes del Sistema de Tickets registradas correctamente.")
 
     async def on_interaction(self, interaction: discord.Interaction):
-        """Monitoreo de interacciones en tiempo real."""
+        """Monitoreo de interacciones en tiempo real y fallback de botones persistentes."""
         logger.info(f"📥 Interacción recibida | Usuario: {interaction.user.name} | Tipo: {interaction.type.name}")
+
+        if interaction.type == discord.InteractionType.component and interaction.data:
+            custom_id = interaction.data.get("custom_id", "")
+            if custom_id.startswith("bot_auth_verify:"):
+                try:
+                    bot_id = int(custom_id.split(":")[1])
+                except Exception:
+                    bot_id = 0
+
+                if interaction.guild and interaction.user.id != interaction.guild.owner_id:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "⛔ **Acceso Denegado:** Solo el **Dueño del Servidor (Owner)** puede autorizar bots con contraseña.",
+                            ephemeral=True
+                        )
+                    return
+
+                modal = BotAuthModal(bot_id=bot_id, bot_name="Bot", message=interaction.message)
+                if not interaction.response.is_done():
+                    await interaction.response.send_modal(modal)
+                return
+
+            elif custom_id.startswith("bot_auth_kick:"):
+                try:
+                    bot_id = int(custom_id.split(":")[1])
+                except Exception:
+                    bot_id = 0
+
+                is_owner = (interaction.guild and interaction.user.id == interaction.guild.owner_id)
+                is_admin = interaction.user.guild_permissions.administrator
+                if not (is_owner or is_admin):
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "⛔ **Acceso Denegado:** Solo el **Owner** o **Administradores** pueden expulsar bots.",
+                            ephemeral=True
+                        )
+                    return
+
+                guild = interaction.guild
+                target_bot = guild.get_member(bot_id) if guild else None
+                bot_name = target_bot.name if target_bot else f"ID {bot_id}"
+                kick_status = ""
+                if target_bot:
+                    try:
+                        await target_bot.kick(reason=f"Anti-Raid: Expulsado por Owner/Admin {interaction.user.name}")
+                        kick_status = f"🔨 Bot **{bot_name}** expulsado del servidor."
+                    except Exception as e:
+                        kick_status = f"⚠️ Falló expulsión ({e})."
+                else:
+                    kick_status = "⚠️ El bot ya no está en el servidor."
+
+                embed = discord.Embed(
+                    title="🔨 BOT EXPULSADO DEL SERVIDOR (ANTI-RAID)",
+                    description=(
+                        f"🤖 **Bot:** `{bot_name}` (`{bot_id}`)\n"
+                        f"👑 **Expulsado por:** {interaction.user.mention} (`{interaction.user.name}`)\n"
+                        f"🛡️ **Motivo:** Bot no reconocido por el Owner.\n"
+                        f"⚡ **Resultado:** {kick_status}"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed.set_footer(text="Denzel XT • Sistema de Seguridad 24/7", icon_url=guild.icon.url if guild and guild.icon else None)
+
+                try:
+                    await interaction.message.edit(content=f"🔨 **Bot {bot_name} rechazado y expulsado.**", embed=embed, view=None)
+                except Exception:
+                    pass
+
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"🔨 Bot **{bot_name}** expulsado del servidor.", ephemeral=True)
+                return
 
     def create_ticket_panel_embed(self, guild: Optional[discord.Guild] = None) -> discord.Embed:
         """Crea el mensaje Embed estético para el panel de tickets con la lista de precios oficial."""
@@ -744,12 +998,19 @@ class DenzerVoiceBot(discord.Client):
         logger.info(f"🔊 Canal de Voz Objetivo: {self.target_channel_id}")
         logger.info(f"🎫 Canal de Tickets Objetivo: {self.ticket_channel_id}")
         logger.info(f"📢 Canal de Anuncios: {self.announcement_channel_id}")
+        logger.info(f"🛡️ Canal de Logs de Seguridad 24/7: {self.security_logs_channel_id}")
         logger.info("🛒 Sistema de Tickets de Compra con Precios: Activo")
         logger.info("🔒 Restricción de Cierre de Tickets (Solo Staff/Owner): Activo")
+        logger.info("🛡️ Suite de Protección (Anti-Nuke, Anti-Raid, Anti-Spam): Activa")
         logger.info("=" * 65)
 
         # Iniciar servidor web de salud para Railway si aplica
         await self.start_cloud_health_server()
+
+        # Asegurar canal de seguridad y logs 24/7 (situado arriba de anuncios)
+        target_guild = self.get_guild(self.guild_id)
+        if target_guild:
+            await self.get_or_create_security_logs_channel(target_guild)
 
         # Asegurar que el panel de tickets esté publicado y actualizado con los precios
         await self.ensure_ticket_panel()
@@ -886,16 +1147,534 @@ class DenzerVoiceBot(discord.Client):
             except Exception as e:
                 logger.error(f"Error generando audio de bienvenida: {e}")
 
-    async def on_message(self, message: discord.Message):
-        """TTS de chat para llamadas."""
-        if message.author.bot or message.author.id == self.user.id:
+    # ==========================================
+    # 🛡️ SISTEMA DE LOGS 24/7 Y GESTIÓN DE CANAL
+    # ==========================================
+
+    async def get_or_create_security_logs_channel(self, guild: Optional[discord.Guild] = None) -> Optional[discord.TextChannel]:
+        """Obtiene o crea el canal 🛡️・logs-24-7 ubicado arriba de anuncios."""
+        if not guild:
+            guild = self.get_guild(self.guild_id)
+        if not guild:
+            return None
+
+        # 1. Buscar por ID configurado
+        if self.security_logs_channel_id:
+            ch = guild.get_channel(self.security_logs_channel_id)
+            if ch:
+                return ch
+            try:
+                ch = await guild.fetch_channel(self.security_logs_channel_id)
+                if ch:
+                    return ch
+            except Exception:
+                pass
+
+        # 2. Buscar por topic o nombre
+        for ch in guild.text_channels:
+            if ch.topic and "denzel_xt_security_logs_24_7" in ch.topic:
+                self.security_logs_channel_id = ch.id
+                return ch
+            if ch.name in ["🛡️・logs-24-7", "logs-24-7", "🛡-logs-24-7"]:
+                self.security_logs_channel_id = ch.id
+                return ch
+
+        # 3. Crear el canal justo arriba de anuncios
+        try:
+            ann_channel = guild.get_channel(self.announcement_channel_id)
+            target_pos = ann_channel.position if ann_channel else 1
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    embed_links=True,
+                    manage_channels=True,
+                    manage_messages=True,
+                    read_message_history=True
+                )
+            }
+            if guild.owner:
+                overwrites[guild.owner] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+            for role in guild.roles:
+                if role.permissions.administrator or any(k in role.name.lower() for k in ["admin", "staff", "owner", "dueño", "fundador"]):
+                    overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+
+            new_ch = await guild.create_text_channel(
+                name="🛡️・logs-24-7",
+                category=None,
+                position=target_pos,
+                overwrites=overwrites,
+                topic="denzel_xt_security_logs_24_7 | Canal oficial de Registros de Seguridad 24/7 de Denzel XT"
+            )
+            if ann_channel:
+                await new_ch.edit(position=ann_channel.position)
+
+            self.security_logs_channel_id = new_ch.id
+            logger.info(f"🛡️ Canal de logs de seguridad creado: #{new_ch.name} (ID: {new_ch.id})")
+            return new_ch
+        except Exception as e:
+            logger.error(f"❌ Error al crear canal de logs de seguridad: {e}", exc_info=True)
+            return None
+
+    async def log_security_event(self, guild: discord.Guild, title: str, description: str, color: discord.Color, thumbnail: Optional[str] = None):
+        """Envía un registro al canal 🛡️・logs-24-7 de forma limpia y confiable."""
+        try:
+            channel = await self.get_or_create_security_logs_channel(guild)
+            if not channel:
+                return
+
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=color,
+                timestamp=discord.utils.utcnow()
+            )
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
+            embed.set_footer(text="Denzel XT • Logs de Seguridad 24/7", icon_url=guild.icon.url if guild and guild.icon else None)
+            await channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ Error al enviar evento al canal de logs: {e}")
+
+    # ==========================================
+    # 🛡️ DEFENSAS ANTI-NUKE
+    # ==========================================
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        """Anti-Nuke: Si alguien intenta borrar canales, baneo automático."""
+        guild = channel.guild
+        if guild.id != self.guild_id:
             return
 
-        if message.channel.id in (self.ticket_channel_id, self.announcement_channel_id):
+        executor = None
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=2):
+                if entry.target and entry.target.id == channel.id:
+                    executor = entry.user
+                    break
+                if abs((discord.utils.utcnow() - entry.created_at).total_seconds()) < 10:
+                    executor = entry.user
+                    break
+        except Exception as e:
+            logger.warning(f"Error consultando audit logs de canal borrado: {e}")
+
+        if not executor:
+            return
+
+        if executor.id == guild.owner_id or executor.id == self.user.id:
+            await self.log_security_event(
+                guild=guild,
+                title="ℹ️ Canal Eliminado por Autorizado",
+                description=f"📁 **Canal:** `#{channel.name}`\n👤 **Autorizado:** {executor.mention} (`{executor.id}`)",
+                color=discord.Color.blue()
+            )
+            return
+
+        logger.warning(f"🚨 ANTI-NUKE: {executor.name} ({executor.id}) borró el canal #{channel.name}!")
+        ban_status = ""
+        try:
+            await guild.ban(executor, reason="Anti-Nuke: Eliminación no autorizada de canal", delete_message_days=0)
+            ban_status = "🔨 **BANEADO AUTOMÁTICAMENTE** del servidor."
+        except Exception as e:
+            ban_status = f"⚠️ Falló el baneo automático ({e}). Retirando permisos..."
+            try:
+                member = guild.get_member(executor.id)
+                if member:
+                    danger_roles = [r for r in member.roles if r.permissions.administrator or r.permissions.manage_channels]
+                    if danger_roles:
+                        await member.remove_roles(*danger_roles, reason="Anti-Nuke: Retiro de emergencia de permisos")
+            except Exception:
+                pass
+
+        await self.log_security_event(
+            guild=guild,
+            title="🚨 ALERTA ANTI-NUKE: CANAL ELIMINADO 🚨",
+            description=(
+                f"**¡Ataque detectado y neutralizado!**\n\n"
+                f"📁 **Canal eliminado:** `#{channel.name}` (`{channel.id}`)\n"
+                f"👤 **Perpetrador:** {executor.mention} (`{executor.name}` - `{executor.id}`)\n"
+                f"🛡️ **Acción de defensa:** {ban_status}"
+            ),
+            color=discord.Color.red()
+        )
+
+    async def on_guild_role_delete(self, role: discord.Role):
+        """Anti-Nuke: Si alguien intenta borrar roles, baneo automático."""
+        guild = role.guild
+        if guild.id != self.guild_id:
+            return
+
+        executor = None
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=2):
+                if entry.target and entry.target.id == role.id:
+                    executor = entry.user
+                    break
+                if abs((discord.utils.utcnow() - entry.created_at).total_seconds()) < 10:
+                    executor = entry.user
+                    break
+        except Exception as e:
+            logger.warning(f"Error consultando audit logs de rol borrado: {e}")
+
+        if not executor:
+            return
+
+        if executor.id == guild.owner_id or executor.id == self.user.id:
+            await self.log_security_event(
+                guild=guild,
+                title="ℹ️ Rol Eliminado por Autorizado",
+                description=f"🎭 **Rol:** `@{role.name}`\n👤 **Autorizado:** {executor.mention} (`{executor.id}`)",
+                color=discord.Color.blue()
+            )
+            return
+
+        logger.warning(f"🚨 ANTI-NUKE: {executor.name} ({executor.id}) borró el rol @{role.name}!")
+        ban_status = ""
+        try:
+            await guild.ban(executor, reason="Anti-Nuke: Eliminación no autorizada de roles", delete_message_days=0)
+            ban_status = "🔨 **BANEADO AUTOMÁTICAMENTE** del servidor."
+        except Exception as e:
+            ban_status = f"⚠️ Falló el baneo automático ({e}). Retirando permisos..."
+            try:
+                member = guild.get_member(executor.id)
+                if member:
+                    danger_roles = [r for r in member.roles if r.permissions.administrator or r.permissions.manage_roles]
+                    if danger_roles:
+                        await member.remove_roles(*danger_roles, reason="Anti-Nuke: Retiro de emergencia de permisos")
+            except Exception:
+                pass
+
+        await self.log_security_event(
+            guild=guild,
+            title="🚨 ALERTA ANTI-NUKE: ROL ELIMINADO 🚨",
+            description=(
+                f"**¡Ataque detectado y neutralizado!**\n\n"
+                f"🎭 **Rol eliminado:** `@{role.name}` (`{role.id}`)\n"
+                f"👤 **Perpetrador:** {executor.mention} (`{executor.name}` - `{executor.id}`)\n"
+                f"🛡️ **Acción de defensa:** {ban_status}"
+            ),
+            color=discord.Color.red()
+        )
+
+    async def on_webhooks_update(self, channel: discord.abc.GuildChannel):
+        """Anti-Nuke: Si alguien no autorizado crea o modifica webhooks, borrado y baneo."""
+        guild = channel.guild
+        if guild.id != self.guild_id:
+            return
+
+        executor = None
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.webhook_create, limit=1):
+                if abs((discord.utils.utcnow() - entry.created_at).total_seconds()) < 10:
+                    executor = entry.user
+                    break
+        except Exception as e:
+            logger.warning(f"Error consultando audit logs de webhook: {e}")
+
+        if not executor or executor.id == guild.owner_id or executor.id == self.user.id:
+            return
+
+        logger.warning(f"🚨 ANTI-NUKE: Webhook creado por {executor.name} ({executor.id}) en #{channel.name}!")
+
+        deleted_count = 0
+        try:
+            if hasattr(channel, "webhooks"):
+                webhooks = await channel.webhooks()
+                for wh in webhooks:
+                    if wh.user and wh.user.id == executor.id:
+                        await wh.delete(reason="Anti-Nuke: Webhook no autorizado")
+                        deleted_count += 1
+        except Exception as e:
+            logger.warning(f"Error eliminando webhooks no autorizados: {e}")
+
+        try:
+            await guild.ban(executor, reason="Anti-Nuke: Creación no autorizada de Webhook")
+            ban_status = "🔨 **BANEADO AUTOMÁTICAMENTE**."
+        except Exception as e:
+            ban_status = f"⚠️ Falló baneo ({e})."
+
+        await self.log_security_event(
+            guild=guild,
+            title="🚨 ALERTA ANTI-NUKE: WEBHOOK DETECTADO 🚨",
+            description=(
+                f"**¡Creación de Webhook malicioso neutralizada!**\n\n"
+                f"📁 **Canal afectado:** `#{channel.name}`\n"
+                f"👤 **Creador:** {executor.mention} (`{executor.name}` - `{executor.id}`)\n"
+                f"🗑️ **Webhooks purgados:** {deleted_count}\n"
+                f"🛡️ **Acción de defensa:** {ban_status}"
+            ),
+            color=discord.Color.red()
+        )
+
+    # ==========================================
+    # 🚫 ANTI-MASS BAN Y ANTI-MASS KICK
+    # ==========================================
+
+    async def on_member_ban(self, guild: discord.Guild, user: Union[discord.User, discord.Member]):
+        """Anti-Mass Ban: Detecta si un usuario o admin deshonesto banea a más de 3 miembros en 15s."""
+        if guild.id != self.guild_id:
+            return
+
+        executor = None
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=1):
+                if entry.target and entry.target.id == user.id:
+                    executor = entry.user
+                    break
+        except Exception:
+            pass
+
+        if not executor or executor.id == guild.owner_id or executor.id == self.user.id:
+            return
+
+        now = time.time()
+        recent = [t for t in self.recent_bans.get(executor.id, []) if now - t < 15.0]
+        recent.append(now)
+        self.recent_bans[executor.id] = recent
+
+        if len(recent) >= 3:
+            logger.critical(f"🚨 ANTI-MASS BAN: {executor.name} ({executor.id}) baneó 3 miembros en 15s!")
+            try:
+                await guild.ban(executor, reason="Anti-Mass Ban: Intento de baneo masivo detenido")
+            except Exception as e:
+                logger.error(f"Error baneando atacante de mass-ban: {e}")
+
+            await self.log_security_event(
+                guild=guild,
+                title="🚨 ALERTA CRÍTICA: ANTI-MASS BAN ACTIVADO 🚨",
+                description=(
+                    f"**¡Ataque de baneo masivo detenido de inmediato!**\n\n"
+                    f"👤 **Atacante:** {executor.mention} (`{executor.name}` - `{executor.id}`)\n"
+                    f"📊 **Baneos intentados:** {len(recent)} en menos de 15 segundos.\n"
+                    f"🛡️ **Acción de defensa:** 🔨 **BANEADO DE INMEDIATO DEL SERVIDOR**."
+                ),
+                color=discord.Color.red()
+            )
+
+    async def on_member_remove(self, member: discord.Member):
+        """Anti-Mass Kick y registro 24/7 de salidas."""
+        guild = member.guild
+        if guild.id != self.guild_id:
+            return
+
+        executor = None
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.kick, limit=1):
+                if entry.target and entry.target.id == member.id:
+                    if abs((discord.utils.utcnow() - entry.created_at).total_seconds()) < 6:
+                        executor = entry.user
+                        break
+        except Exception:
+            pass
+
+        if executor and executor.id != guild.owner_id and executor.id != self.user.id:
+            now = time.time()
+            recent = [t for t in self.recent_kicks.get(executor.id, []) if now - t < 15.0]
+            recent.append(now)
+            self.recent_kicks[executor.id] = recent
+
+            if len(recent) >= 3:
+                logger.critical(f"🚨 ANTI-MASS KICK: {executor.name} ({executor.id}) expulsó 3 miembros en 15s!")
+                try:
+                    await member.guild.ban(executor, reason="Anti-Mass Kick: Intento de expulsión masiva detenido")
+                except Exception as e:
+                    logger.error(f"Error baneando atacante de mass-kick: {e}")
+
+                await self.log_security_event(
+                    guild=guild,
+                    title="🚨 ALERTA CRÍTICA: ANTI-MASS KICK ACTIVADO 🚨",
+                    description=(
+                        f"**¡Ataque de expulsión masiva detenido de inmediato!**\n\n"
+                        f"👤 **Atacante:** {executor.mention} (`{executor.name}` - `{executor.id}`)\n"
+                        f"📊 **Expulsiones intentadas:** {len(recent)} en menos de 15 segundos.\n"
+                        f"🛡️ **Acción de defensa:** 🔨 **BANEADO DE INMEDIATO DEL SERVIDOR**."
+                    ),
+                    color=discord.Color.red()
+                )
+                return
+
+        # Salida normal de miembro
+        await self.log_security_event(
+            guild=guild,
+            title="📤 Miembro ha Salido del Servidor",
+            description=(
+                f"👤 {member.mention} (`{member.name}` - `{member.id}`)\n"
+                f"👥 Total de miembros restantes: **{guild.member_count}**"
+            ),
+            color=discord.Color.dark_grey(),
+            thumbnail=member.display_avatar.url if member.display_avatar else None
+        )
+
+    # ==========================================
+    # 🤖 ANTI-RAID / ANTI-BOTS MALICIOSOS (CON PASSWORD DEL OWNER)
+    # ==========================================
+
+    async def on_member_join(self, member: discord.Member):
+        """Anti-Raid / Bots Maliciosos y registro 24/7 de entradas."""
+        guild = member.guild
+        if guild.id != self.guild_id:
+            return
+
+        # Si el miembro que entra es un BOT
+        if member.bot:
+            if member.id == self.user.id:
+                return
+
+            logger.warning(f"🤖 Bot detectado ingresando al servidor: {member.name} ({member.id})")
+
+            inviter = None
+            try:
+                async for entry in guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=2):
+                    if entry.target and entry.target.id == member.id:
+                        inviter = entry.user
+                        break
+            except Exception as e:
+                logger.warning(f"Aviso buscando inviter del bot: {e}")
+
+            logs_channel = await self.get_or_create_security_logs_channel(guild)
+            if logs_channel:
+                embed = discord.Embed(
+                    title="🚨 ALERTA ANTI-RAID: NUEVO BOT DETECTADO 🚨",
+                    description=(
+                        f"Se ha detectado el ingreso de un nuevo bot al servidor:\n\n"
+                        f"🤖 **Bot:** {member.mention} (`{member.name}` - `{member.id}`)\n"
+                        f"👤 **Invitado por:** {inviter.mention if inviter else 'Desconocido'} (`{inviter.id if inviter else 'N/A'}`)\n"
+                        f"📅 **Cuenta creada:** <t:{int(member.created_at.timestamp())}:R>\n\n"
+                        f"⚠️ **ESTADO:** *Pendiente de Autorización por el Dueño (Owner).*\n\n"
+                        f"🔒 **Instrucciones para el Owner:**\n"
+                        f"• Si autorizas este bot en el servidor, presiona **Autorizar Bot** e ingresa la contraseña (`rafaxd`).\n"
+                        f"• Si **NO** reconoces el bot, presiona **No reconozco el bot** para expulsarlo inmediatamente."
+                    ),
+                    color=discord.Color.from_rgb(255, 69, 0),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed.set_footer(text="Denzel XT • Sistema Anti-Bots Maliciosos 24/7", icon_url=guild.icon.url if guild and guild.icon else None)
+
+                view = BotVerificationView(bot_id=member.id, bot_name=member.name)
+                owner_mention = guild.owner.mention if guild.owner else "@everyone"
+                await logs_channel.send(
+                    content=f"⚠️ {owner_mention} **¡ATENCIÓN! Bot detectado sin autorización.**",
+                    embed=embed,
+                    view=view
+                )
+            return
+
+        # Entrada de usuario normal
+        await self.log_security_event(
+            guild=guild,
+            title="📥 Nuevo Miembro Unido",
+            description=(
+                f"👤 {member.mention} (`{member.name}` - `{member.id}`)\n"
+                f"📅 Cuenta creada: <t:{int(member.created_at.timestamp())}:R>\n"
+                f"👥 Total de miembros: **{guild.member_count}**"
+            ),
+            color=discord.Color.green(),
+            thumbnail=member.display_avatar.url if member.display_avatar else None
+        )
+
+    # ==========================================
+    # 🔗 ANTI-SPAM, ANTI-LINKS Y TTS DE CHAT
+    # ==========================================
+
+    async def on_message(self, message: discord.Message):
+        """Filtro Anti-Spam, Anti-Links e Invitaciones, y TTS de chat para llamadas."""
+        if not message.guild or message.author.bot or message.author.id == self.user.id:
+            return
+
+        # 1. FILTRO ANTI-LINKS (INVITACIONES DE DISCORD)
+        if INVITE_REGEX.search(message.content):
+            if not is_user_staff_or_owner(message.author, message.guild):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+
+                timeout_success = False
+                try:
+                    await message.author.timeout(
+                        datetime.timedelta(minutes=10),
+                        reason="Anti-Links: Envío de enlace de invitación a otro servidor"
+                    )
+                    timeout_success = True
+                except Exception as e:
+                    logger.warning(f"No se pudo aplicar timeout por anti-links: {e}")
+
+                try:
+                    await message.channel.send(
+                        f"⛔ {message.author.mention} **¡Prohibido enviar invitaciones a otros servidores!**\n"
+                        f"Has sido silenciado por **10 minutos** automáticamente por seguridad.",
+                        delete_after=7
+                    )
+                except Exception:
+                    pass
+
+                await self.log_security_event(
+                    guild=message.guild,
+                    title="🚨 ALERTA ANTI-LINKS: INVITACIÓN BLOQUEADA 🚨",
+                    description=(
+                        f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
+                        f"💬 **Canal:** {message.channel.mention}\n"
+                        f"🔗 **Contenido:** `||{message.content[:200]}||`\n"
+                        f"🛡️ **Acción:** Mensaje eliminado + {'Silenciado 10 minutos (Timeout)' if timeout_success else 'Mensaje eliminado'}"
+                    ),
+                    color=discord.Color.orange()
+                )
+                return
+
+        # 2. FILTRO ANTI-SPAM (FLOODING MASIVO)
+        if not is_user_staff_or_owner(message.author, message.guild):
+            now = time.time()
+            author_id = message.author.id
+            times = [t for t in self.user_message_timestamps.get(author_id, []) if now - t < 4.0]
+            times.append(now)
+            self.user_message_timestamps[author_id] = times
+
+            if len(times) >= 5:
+                self.user_message_timestamps[author_id] = []
+                timeout_success = False
+                try:
+                    await message.author.timeout(
+                        datetime.timedelta(minutes=5),
+                        reason="Anti-Spam: Envío masivo de mensajes (Flooding)"
+                    )
+                    timeout_success = True
+                except Exception as e:
+                    logger.warning(f"No se pudo aplicar timeout por anti-spam: {e}")
+
+                try:
+                    await message.channel.send(
+                        f"⚠️ {message.author.mention} **Has sido silenciado por 5 minutos por saturar el chat (Anti-Spam).**",
+                        delete_after=7
+                    )
+                except Exception:
+                    pass
+
+                await self.log_security_event(
+                    guild=message.guild,
+                    title="🚨 ALERTA ANTI-SPAM: FLOOD DETECTADO 🚨",
+                    description=(
+                        f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
+                        f"💬 **Canal:** {message.channel.mention}\n"
+                        f"📊 **Motivo:** Envió 5 o más mensajes en menos de 4 segundos.\n"
+                        f"🛡️ **Acción:** {'Silenciado por 5 minutos (Timeout)' if timeout_success else 'Advertencia enviada'}"
+                    ),
+                    color=discord.Color.gold()
+                )
+                return
+
+        # 3. CANALES EXCLUIDOS DE TTS
+        if message.channel.id in (self.ticket_channel_id, self.announcement_channel_id, self.security_logs_channel_id):
             return
         if hasattr(message.channel, "name") and message.channel.name.startswith("ticket-"):
             return
 
+        # 4. REPRODUCCIÓN TTS PARA LLAMADAS DE VOZ
         is_target_channel = (message.channel.id == self.target_channel_id)
         is_mentioned = self.user.mentioned_in(message)
 
@@ -1031,6 +1810,7 @@ def run_bot():
     try:
         intents_full = discord.Intents.default()
         intents_full.guilds = True
+        intents_full.members = True
         intents_full.voice_states = True
         intents_full.messages = True
         intents_full.message_content = True
