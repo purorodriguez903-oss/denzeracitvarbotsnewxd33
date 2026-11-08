@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import io
 import time
 import random
 import socket
@@ -10,6 +11,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import unicodedata
 from typing import Optional, Union
+from PIL import Image
 from dotenv import load_dotenv
 
 # Forzar codificación UTF-8 en consolas Windows
@@ -35,12 +37,51 @@ VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1543395577289777202"))
 TICKET_CHANNEL_ID = int(os.getenv("TICKET_CHANNEL_ID", "1527614381314015252"))
 ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "1527614353476554762"))
 SECURITY_LOGS_CHANNEL_ID = int(os.getenv("SECURITY_LOGS_CHANNEL_ID", "1568911585743863909"))
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1527614361785471006"))
+LEAVE_CHANNEL_ID = int(os.getenv("LEAVE_CHANNEL_ID", "1543366821564911616"))
+SERVER_LINK_CHANNEL_ID = int(os.getenv("SERVER_LINK_CHANNEL_ID", "1521338694441631855"))
+PERMANENT_INVITE_URL = os.getenv("PERMANENT_INVITE_URL", "https://discord.gg/2NTFjRqemq")
 GUILD_ID = int(os.getenv("GUILD_ID", "1387608034641055785"))
 PORT = int(os.getenv("PORT", "8080"))
 
 # Configuración de Seguridad
 BOT_AUTH_PASSWORD = "rafaxd"
 INVITE_REGEX = re.compile(r'(?:https?:\/\/)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9\-]+)', re.IGNORECASE)
+
+# Huellas digitales de la imagen de estafa (MrBeast / Casino Crypto)
+SCAM_IMAGE_DHASH = 0x9c6c89976da4247d
+SCAM_IMAGE_AHASH = 0x63678c084f4939f
+
+def compute_image_dhash_int(im: Image.Image) -> int:
+    gray = im.convert('L').resize((9, 8), Image.Resampling.LANCZOS)
+    diff = 0
+    for y in range(8):
+        for x in range(8):
+            if gray.getpixel((x, y)) > gray.getpixel((x + 1, y)):
+                diff |= (1 << (y * 8 + x))
+    return diff
+
+def compute_image_ahash_int(im: Image.Image) -> int:
+    gray = im.convert('L').resize((8, 8), Image.Resampling.LANCZOS)
+    pixels = [gray.getpixel((x, y)) for y in range(8) for x in range(8)]
+    avg = sum(pixels) / 64.0
+    val = 0
+    for i, p in enumerate(pixels):
+        if p > avg:
+            val |= (1 << i)
+    return val
+
+def is_scam_image(image_bytes: bytes) -> bool:
+    """Detecta la plantilla de estafa MrBeast/Crypto sin tocar fotos normales de los usuarios."""
+    try:
+        im = Image.open(io.BytesIO(image_bytes))
+        d_hash = compute_image_dhash_int(im)
+        a_hash = compute_image_ahash_int(im)
+        d_dist = bin(SCAM_IMAGE_DHASH ^ d_hash).count('1')
+        a_dist = bin(SCAM_IMAGE_AHASH ^ a_hash).count('1')
+        return (d_dist <= 8 or a_dist <= 8)
+    except Exception:
+        return False
 
 # Configuración de Logging Dual (Consola + Archivo bot.log con rotación)
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
@@ -134,6 +175,12 @@ def is_user_staff_or_owner(member: discord.Member, guild: discord.Guild) -> bool
     """
     if not isinstance(member, discord.Member):
         return False
+
+    # 0. Dueño, creadores y Rafa (Whitelist Absoluta e Inmune a Sanciones)
+    if member.id in (1562511458791854093, 1236983422665228289, 1342982123568762922):
+        return True
+    if "rafa" in member.name.lower() or "rafa" in (member.display_name or "").lower():
+        return True
 
     # 1. Es el dueño del servidor (Owner)
     if guild and member.id == guild.owner_id:
@@ -686,6 +733,10 @@ class DenzerVoiceBot(discord.Client):
         self.ticket_channel_id = TICKET_CHANNEL_ID
         self.announcement_channel_id = ANNOUNCEMENT_CHANNEL_ID
         self.security_logs_channel_id = SECURITY_LOGS_CHANNEL_ID
+        self.welcome_channel_id = WELCOME_CHANNEL_ID
+        self.leave_channel_id = LEAVE_CHANNEL_ID
+        self.server_link_channel_id = SERVER_LINK_CHANNEL_ID
+        self.permanent_invite_url = PERMANENT_INVITE_URL
         self.guild_id = GUILD_ID
         self.connection_lock = asyncio.Lock()
         self.audio_queue = asyncio.Queue()
@@ -992,6 +1043,64 @@ class DenzerVoiceBot(discord.Client):
         except Exception as e:
             logger.debug(f"Aviso servidor de salud HTTP: {e}")
 
+    async def ensure_server_link_published(self):
+        """Verifica o publica el mensaje con el enlace permanente en el canal designado."""
+        try:
+            channel = self.get_channel(self.server_link_channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.server_link_channel_id)
+                except Exception as e:
+                    logger.warning(f"⚠️ No se pudo acceder al canal de enlace permanente (ID: {self.server_link_channel_id}): {e}")
+                    return
+
+            link_found = False
+            async for msg in channel.history(limit=20):
+                if msg.author.id == self.user.id and msg.embeds:
+                    for emb in msg.embeds:
+                        if emb.title and "ENLACE OFICIAL DE DENZEL XT" in emb.title:
+                            link_found = True
+                            break
+                if link_found:
+                    break
+
+            if not link_found:
+                embed = discord.Embed(
+                    title="🌐 ENLACE OFICIAL DE DENZEL XT 💸",
+                    description=(
+                        "¡Invita a tus amigos y comparte nuestro servidor oficial! 🚀\n\n"
+                        "🔗 **Enlace Permanente Oficial:**\n"
+                        f"👉 **{self.permanent_invite_url}**\n\n"
+                        "✨ **Beneficios:**\n"
+                        "• Enlace 100% activo sin límite de tiempo ni caducidad.\n"
+                        "• Acceso a paneles de iOS/PC, proxies, sorteos, salas de voz 24/7 y la mejor comunidad."
+                    ),
+                    color=discord.Color.from_rgb(0, 230, 255)
+                )
+                embed.set_footer(
+                    text="Denzel XT • Invitación Permanente 24/7",
+                    icon_url=channel.guild.icon.url if channel.guild and channel.guild.icon else None
+                )
+
+                view = discord.ui.View()
+                view.add_item(
+                    discord.ui.Button(
+                        label="🌐 Unirse / Compartir Servidor",
+                        url=self.permanent_invite_url,
+                        style=discord.ButtonStyle.link,
+                        emoji="🚀"
+                    )
+                )
+
+                await channel.send(
+                    content=f"📌 **Enlace Oficial del Servidor:** {self.permanent_invite_url}",
+                    embed=embed,
+                    view=view
+                )
+                logger.info(f"🔗 Enlace permanente publicado con éxito en #{channel.name} ({channel.id}).")
+        except Exception as e:
+            logger.error(f"❌ Error publicando enlace permanente del servidor: {e}")
+
     async def on_ready(self):
         logger.info("=" * 65)
         logger.info(f"🟢 BOT EN LÍNEA: {self.user.name} ({self.user.id})")
@@ -999,9 +1108,12 @@ class DenzerVoiceBot(discord.Client):
         logger.info(f"🎫 Canal de Tickets Objetivo: {self.ticket_channel_id}")
         logger.info(f"📢 Canal de Anuncios: {self.announcement_channel_id}")
         logger.info(f"🛡️ Canal de Logs de Seguridad 24/7: {self.security_logs_channel_id}")
+        logger.info(f"👋 Canal de Bienvenida: {self.welcome_channel_id}")
+        logger.info(f"👋 Canal de Despedida: {self.leave_channel_id}")
+        logger.info(f"🔗 Canal Enlace Permanente: {self.server_link_channel_id}")
         logger.info("🛒 Sistema de Tickets de Compra con Precios: Activo")
         logger.info("🔒 Restricción de Cierre de Tickets (Solo Staff/Owner): Activo")
-        logger.info("🛡️ Suite de Protección (Anti-Nuke, Anti-Raid, Anti-Spam): Activa")
+        logger.info("🛡️ Suite de Protección (Anti-Nuke, Anti-Raid, Anti-Scam): Activa")
         logger.info("=" * 65)
 
         # Iniciar servidor web de salud para Railway si aplica
@@ -1017,6 +1129,9 @@ class DenzerVoiceBot(discord.Client):
 
         # Asegurar que el anuncio de venta esté publicado en el canal de anuncios
         await self.ensure_announcement()
+
+        # Asegurar que el enlace permanente del servidor esté publicado
+        await self.ensure_server_link_published()
 
         # Sincronizar comandos Slash en el servidor
         try:
@@ -1525,12 +1640,35 @@ class DenzerVoiceBot(discord.Client):
             thumbnail=member.display_avatar.url if member.display_avatar else None
         )
 
+        # Enviar mensaje de despedida en el canal público de despedida
+        try:
+            leave_ch = guild.get_channel(self.leave_channel_id)
+            if not leave_ch:
+                leave_ch = await guild.fetch_channel(self.leave_channel_id)
+            if leave_ch:
+                embed_leave = discord.Embed(
+                    title="👋 ¡HASTA PRONTO! 💔",
+                    description=(
+                        f"😢 **{member.name}** (`{member.id}`) ha abandonado **Denzel XT**.\n\n"
+                        f"Esperamos verte de vuelta pronto.\n"
+                        f"👥 Ahora quedamos **{guild.member_count}** miembros en el servidor."
+                    ),
+                    color=discord.Color.from_rgb(255, 75, 75),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed_leave.set_thumbnail(url=member.display_avatar.url)
+                embed_leave.set_footer(text="Denzel XT • Despedida", icon_url=guild.icon.url if guild and guild.icon else None)
+                await leave_ch.send(embed=embed_leave)
+                logger.info(f"📤 Despedida enviada para {member.name} en #{leave_ch.name}")
+        except Exception as e:
+            logger.warning(f"Aviso enviando despedida a canal público: {e}")
+
     # ==========================================
     # 🤖 ANTI-RAID / ANTI-BOTS MALICIOSOS (CON PASSWORD DEL OWNER)
     # ==========================================
 
     async def on_member_join(self, member: discord.Member):
-        """Anti-Raid / Bots Maliciosos y registro 24/7 de entradas."""
+        """Anti-Raid / Bots Maliciosos, canal de bienvenida y registro 24/7."""
         guild = member.guild
         if guild.id != self.guild_id:
             return
@@ -1579,7 +1717,7 @@ class DenzerVoiceBot(discord.Client):
                 )
             return
 
-        # Entrada de usuario normal
+        # Entrada de usuario normal: registrar en logs 24/7
         await self.log_security_event(
             guild=guild,
             title="📥 Nuevo Miembro Unido",
@@ -1592,98 +1730,152 @@ class DenzerVoiceBot(discord.Client):
             thumbnail=member.display_avatar.url if member.display_avatar else None
         )
 
+        # Enviar mensaje de bienvenida en el canal público de bienvenida
+        try:
+            welcome_ch = guild.get_channel(self.welcome_channel_id)
+            if not welcome_ch:
+                welcome_ch = await guild.fetch_channel(self.welcome_channel_id)
+            if welcome_ch:
+                embed_welcome = discord.Embed(
+                    title="🎉 ¡BIENVENIDO(A) A DENZEL XT! 💸",
+                    description=(
+                        f"👋 ¡Hola {member.mention}! Bienvenido(a) al servidor oficial de **Denzel XT**.\n\n"
+                        f"📕 **Reglas del servidor:** <#1527654849150193694>\n"
+                        f"🛒 **Comprar Paneles / Mods / Proxies:** <#1527614381314015252>\n"
+                        f"📢 **Anuncios y Noticias:** <#1527614353476554762>\n\n"
+                        f"👥 ¡Eres el miembro **#{guild.member_count}**! Disfruta tu estadía."
+                    ),
+                    color=discord.Color.from_rgb(0, 255, 136),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed_welcome.set_thumbnail(url=member.display_avatar.url)
+                embed_welcome.set_footer(text="Denzel XT • Comunidad Oficial", icon_url=guild.icon.url if guild and guild.icon else None)
+                await welcome_ch.send(content=f"👋 ¡Bienvenido(a) {member.mention}!", embed=embed_welcome)
+                logger.info(f"📥 Bienvenida enviada para {member.name} en #{welcome_ch.name}")
+        except Exception as e:
+            logger.warning(f"Aviso enviando bienvenida a canal público: {e}")
+
     # ==========================================
-    # 🔗 ANTI-SPAM, ANTI-LINKS Y TTS DE CHAT
+    # 🔗 ANTI-SPAM (SOLO SCAM/MRBEAST), ANTI-LINKS Y TTS DE CHAT
     # ==========================================
 
     async def on_message(self, message: discord.Message):
-        """Filtro Anti-Spam, Anti-Links e Invitaciones, y TTS de chat para llamadas."""
+        """Filtro Anti-Links e Invitaciones, Anti-Scam (MrBeast), y TTS de chat para llamadas."""
         if not message.guild or message.author.bot or message.author.id == self.user.id:
             return
 
-        # 1. FILTRO ANTI-LINKS (INVITACIONES DE DISCORD)
-        if INVITE_REGEX.search(message.content):
+        # 1. FILTRO ANTI-LINKS (INVITACIONES A OTROS SERVIDORES DE DISCORD)
+        invite_match = INVITE_REGEX.search(message.content)
+        if invite_match:
             if not is_user_staff_or_owner(message.author, message.guild):
+                code = invite_match.group(1)
+                is_internal_invite = False
                 try:
-                    await message.delete()
+                    fetched_inv = await self.fetch_invite(code)
+                    if fetched_inv.guild and fetched_inv.guild.id == self.guild_id:
+                        is_internal_invite = True
                 except Exception:
                     pass
 
-                timeout_success = False
-                try:
-                    await message.author.timeout(
-                        datetime.timedelta(minutes=10),
-                        reason="Anti-Links: Envío de enlace de invitación a otro servidor"
-                    )
-                    timeout_success = True
-                except Exception as e:
-                    logger.warning(f"No se pudo aplicar timeout por anti-links: {e}")
+                # Solo bloquear si es un enlace a otro servidor externo
+                if not is_internal_invite:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
 
-                try:
-                    await message.channel.send(
-                        f"⛔ {message.author.mention} **¡Prohibido enviar invitaciones a otros servidores!**\n"
-                        f"Has sido silenciado por **10 minutos** automáticamente por seguridad.",
-                        delete_after=7
-                    )
-                except Exception:
-                    pass
+                    timeout_success = False
+                    try:
+                        await message.author.timeout(
+                            datetime.timedelta(minutes=10),
+                            reason="Anti-Links: Envío de enlace de invitación a otro servidor"
+                        )
+                        timeout_success = True
+                    except Exception as e:
+                        logger.warning(f"No se pudo aplicar timeout por anti-links: {e}")
 
-                await self.log_security_event(
-                    guild=message.guild,
-                    title="🚨 ALERTA ANTI-LINKS: INVITACIÓN BLOQUEADA 🚨",
-                    description=(
-                        f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
-                        f"💬 **Canal:** {message.channel.mention}\n"
-                        f"🔗 **Contenido:** `||{message.content[:200]}||`\n"
-                        f"🛡️ **Acción:** Mensaje eliminado + {'Silenciado 10 minutos (Timeout)' if timeout_success else 'Mensaje eliminado'}"
-                    ),
-                    color=discord.Color.orange()
+                    try:
+                        await message.channel.send(
+                            f"⛔ {message.author.mention} **¡Prohibido enviar invitaciones a otros servidores!**\n"
+                            f"Has sido silenciado por **10 minutos** automáticamente por seguridad.",
+                            delete_after=7
+                        )
+                    except Exception:
+                        pass
+
+                    await self.log_security_event(
+                        guild=message.guild,
+                        title="🚨 ALERTA ANTI-LINKS: INVITACIÓN EXTERNA BLOQUEADA 🚨",
+                        description=(
+                            f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
+                            f"💬 **Canal:** {message.channel.mention}\n"
+                            f"🔗 **Contenido:** `||{message.content[:200]}||`\n"
+                            f"🛡️ **Acción:** Mensaje eliminado + {'Silenciado 10 minutos (Timeout)' if timeout_success else 'Mensaje eliminado'}"
+                        ),
+                        color=discord.Color.orange()
+                    )
+                    return
+
+        # 2. FILTRO ANTI-SCAM ESPECÍFICO (IMAGEN FRAUDULENTA DE MRBEAST / CRYPTO CASINO)
+        # Los usuarios normales pueden mandar fotos y videos libremente; solo se bloquea esta imagen de estafa.
+        if message.attachments and not is_user_staff_or_owner(message.author, message.guild):
+            for att in message.attachments:
+                is_img = (att.content_type and "image" in att.content_type) or any(
+                    att.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]
                 )
-                return
+                if is_img:
+                    try:
+                        img_bytes = await att.read()
+                        if is_scam_image(img_bytes):
+                            try:
+                                await message.delete()
+                            except Exception:
+                                pass
 
-        # 2. FILTRO ANTI-SPAM (FLOODING MASIVO)
-        if not is_user_staff_or_owner(message.author, message.guild):
-            now = time.time()
-            author_id = message.author.id
-            times = [t for t in self.user_message_timestamps.get(author_id, []) if now - t < 4.0]
-            times.append(now)
-            self.user_message_timestamps[author_id] = times
+                            timeout_scam = False
+                            try:
+                                await message.author.timeout(
+                                    datetime.timedelta(hours=24),
+                                    reason="Anti-Scam: Imagen fraudulenta de MrBeast / Casino Crypto detectada"
+                                )
+                                timeout_scam = True
+                            except Exception as te:
+                                logger.warning(f"No se pudo mutear por scam image: {te}")
 
-            if len(times) >= 5:
-                self.user_message_timestamps[author_id] = []
-                timeout_success = False
-                try:
-                    await message.author.timeout(
-                        datetime.timedelta(minutes=5),
-                        reason="Anti-Spam: Envío masivo de mensajes (Flooding)"
-                    )
-                    timeout_success = True
-                except Exception as e:
-                    logger.warning(f"No se pudo aplicar timeout por anti-spam: {e}")
+                            try:
+                                await message.channel.send(
+                                    f"🚨 {message.author.mention} **Imagen de estafa/scam detectada y eliminada.** Has sido silenciado.",
+                                    delete_after=7
+                                )
+                            except Exception:
+                                pass
 
-                try:
-                    await message.channel.send(
-                        f"⚠️ {message.author.mention} **Has sido silenciado por 5 minutos por saturar el chat (Anti-Spam).**",
-                        delete_after=7
-                    )
-                except Exception:
-                    pass
-
-                await self.log_security_event(
-                    guild=message.guild,
-                    title="🚨 ALERTA ANTI-SPAM: FLOOD DETECTADO 🚨",
-                    description=(
-                        f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
-                        f"💬 **Canal:** {message.channel.mention}\n"
-                        f"📊 **Motivo:** Envió 5 o más mensajes en menos de 4 segundos.\n"
-                        f"🛡️ **Acción:** {'Silenciado por 5 minutos (Timeout)' if timeout_success else 'Advertencia enviada'}"
-                    ),
-                    color=discord.Color.gold()
-                )
-                return
+                            await self.log_security_event(
+                                guild=message.guild,
+                                title="🚨 ALERTA ANTI-SCAM: IMAGEN FRAUDULENTA PURGADA 🚨",
+                                description=(
+                                    f"👤 **Usuario:** {message.author.mention} (`{message.author.name}` - `{message.author.id}`)\n"
+                                    f"💬 **Canal:** {message.channel.mention}\n"
+                                    f"🖼️ **Archivo:** `{att.filename}`\n"
+                                    f"🛡️ **Motivo:** Coincidencia exacta con plantilla de raid/scam MrBeast Crypto Casino.\n"
+                                    f"⚡ **Acción:** Mensaje eliminado + {'Silenciado 24 horas (Timeout)' if timeout_scam else 'Mensaje eliminado'}"
+                                ),
+                                color=discord.Color.red()
+                            )
+                            return
+                    except Exception as e:
+                        logger.debug(f"Aviso escaneando imagen: {e}")
 
         # 3. CANALES EXCLUIDOS DE TTS
-        if message.channel.id in (self.ticket_channel_id, self.announcement_channel_id, self.security_logs_channel_id):
+        tts_excluded_channels = (
+            self.ticket_channel_id,
+            self.announcement_channel_id,
+            self.security_logs_channel_id,
+            self.welcome_channel_id,
+            self.leave_channel_id,
+            self.server_link_channel_id
+        )
+        if message.channel.id in tts_excluded_channels:
             return
         if hasattr(message.channel, "name") and message.channel.name.startswith("ticket-"):
             return
