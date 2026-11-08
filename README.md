@@ -79,16 +79,15 @@ El bot incluye un sistema interactivo de compras mediante tickets privados:
 
 El proyecto incluye `Dockerfile`, `Procfile` y `nixpacks.toml` listos para funcionar sin apagar la PC:
 
-1. **Crear proyecto en [Railway.app](https://railway.app):**
-   - Inicia sesión y haz clic en **New Project** -> **Deploy from GitHub repo**.
-   - Selecciona el repositorio: [`denzelnuevarailwayxd`](https://github.com/purorodriguez903-oss/denzelnuevarailwayxd).
+1. **Crear o mantener proyecto en [Railway.app](https://railway.app):**
+   - Inicia sesión y selecciona tu servicio conectado al repositorio: [`rafadenzkit3`](https://github.com/purorodriguez903-oss/rafadenzkit3).
 2. **Configurar Variables de Entorno en Railway:**
-   - Ve a la pestaña **Variables** de tu servicio y agrega:
+   - Ve a la pestaña **Variables** de tu servicio y asegúrate de tener:
      - `DISCORD_TOKEN` = Tu token secreto de bot.
      - `VOICE_CHANNEL_ID` = `1543395577289777202`
      - `GUILD_ID` = `1387608034641055785`
      - `TICKET_CHANNEL_ID` = `1527614381314015252`
-3. **¡Listo!** Railway detectará el `Dockerfile` automáticamente, instalará Python, FFmpeg y las dependencias, y mantendrá el bot activo 24/7 sin interrupciones.
+3. **¡Listo!** Cada cambio subido a `rafadenzkit3` se desplegará automáticamente en Railway manteniéndolo activo 24/7.
 
 ---
 
