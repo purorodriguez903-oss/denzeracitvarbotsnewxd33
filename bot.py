@@ -3,6 +3,7 @@ import sys
 import re
 import io
 import time
+import json
 import random
 import socket
 import asyncio
@@ -45,11 +46,24 @@ PERMANENT_INVITE_URL = os.getenv("PERMANENT_INVITE_URL", "https://discord.gg/2NT
 GUILD_ID = int(os.getenv("GUILD_ID", "1387608034641055785"))
 PORT = int(os.getenv("PORT", "8080"))
 
+# Nuevos Canales y Roles del Sistema Denzel XT
+REFERENCES_CHANNEL_ID = int(os.getenv("REFERENCES_CHANNEL_ID", "1527614373588373504"))
+LIVES_CHANNEL_ID = int(os.getenv("LIVES_CHANNEL_ID", "1552827664136540211"))
+FREE_KEYS_CHANNEL_ID = int(os.getenv("FREE_KEYS_CHANNEL_ID", "1529687325146353674"))
+CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1527614241996013678"))
+RESELLER_ROLE_ID = int(os.getenv("RESELLER_ROLE_ID", "1530649167796637887"))
+
+# Archivos de datos y persistencia en data/
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+GIVEAWAYS_FILE = os.path.join(DATA_DIR, "giveaways.json")
+INVITES_FILE = os.path.join(DATA_DIR, "invites.json")
+
 # Configuración de Seguridad
 BOT_AUTH_PASSWORD = "rafaxd"
 INVITE_REGEX = re.compile(r'(?:https?:\/\/)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9\-]+)', re.IGNORECASE)
 
-# Banner oficial para bienvenidas y despedidas
+# Banner oficial para bienvenidas, despedidas y eventos
 BANNER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "denzel_banner.jpg")
 
 def format_account_age(created_at: datetime.datetime) -> str:
@@ -572,8 +586,495 @@ class TicketConfirmCloseView(discord.ui.View):
         await interaction.response.send_message("❌ Operación cancelada. El ticket permanece abierto.", ephemeral=True)
 
 
+# ==========================================
+# 📈 SISTEMA DE CRECIMIENTO E INVITACIONES (/invites)
+# ==========================================
+
+class InviteManager:
+    """Gestor persistente de invitaciones y crecimiento del servidor."""
+    def __init__(self, filepath: str = INVITES_FILE):
+        self.filepath = filepath
+        self.lock = asyncio.Lock()
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Error cargando invites.json: {e}")
+        return {"inviters": {}, "members": {}}
+
+    def _save(self):
+        try:
+            temp_file = self.filepath + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_file, self.filepath)
+        except Exception as e:
+            logger.error(f"Error guardando invites.json: {e}")
+
+    async def record_join(self, inviter_id: int, member_id: int):
+        async with self.lock:
+            inv_str = str(inviter_id)
+            mem_str = str(member_id)
+            self.data.setdefault("members", {})[mem_str] = inv_str
+            inviters = self.data.setdefault("inviters", {})
+            if inv_str not in inviters:
+                inviters[inv_str] = {"total": 0, "active": 0, "leaves": 0}
+            inviters[inv_str]["total"] += 1
+            inviters[inv_str]["active"] += 1
+            self._save()
+
+    async def record_leave(self, member_id: int) -> Optional[int]:
+        async with self.lock:
+            mem_str = str(member_id)
+            inv_str = self.data.get("members", {}).get(mem_str)
+            if inv_str and inv_str in self.data.get("inviters", {}):
+                self.data["inviters"][inv_str]["leaves"] += 1
+                self.data["inviters"][inv_str]["active"] = max(
+                    0, self.data["inviters"][inv_str]["total"] - self.data["inviters"][inv_str]["leaves"]
+                )
+                self._save()
+                return int(inv_str)
+            return None
+
+    def get_stats(self, user_id: int) -> dict:
+        inv_str = str(user_id)
+        return self.data.get("inviters", {}).get(inv_str, {"total": 0, "active": 0, "leaves": 0})
+
+    def get_top_inviters(self, limit: int = 10) -> list[tuple[int, dict]]:
+        items = []
+        for uid_str, stats in self.data.get("inviters", {}).items():
+            try:
+                items.append((int(uid_str), stats))
+            except Exception:
+                pass
+        items.sort(key=lambda x: (x[1].get("active", 0), x[1].get("total", 0)), reverse=True)
+        return items[:limit]
+
+
+# ==========================================
+# 🎁 SISTEMA DE SORTEOS PERSISTENTE (/sorteo)
+# ==========================================
+
+class GiveawayManager:
+    """Gestor persistente de sorteos con participantes y selección automática de ganadores."""
+    def __init__(self, filepath: str = GIVEAWAYS_FILE):
+        self.filepath = filepath
+        self.lock = asyncio.Lock()
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Error cargando giveaways.json: {e}")
+        return {"active": {}, "history": []}
+
+    def _save(self):
+        try:
+            temp_file = self.filepath + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_file, self.filepath)
+        except Exception as e:
+            logger.error(f"Error guardando giveaways.json: {e}")
+
+    async def create_giveaway(self, giveaway_id: str, channel_id: int, message_id: int,
+                              prize: str, winners_count: int, host_id: int, end_time: float):
+        async with self.lock:
+            self.data.setdefault("active", {})[giveaway_id] = {
+                "id": giveaway_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "prize": prize,
+                "winners_count": max(1, winners_count),
+                "host_id": host_id,
+                "end_time": end_time,
+                "participants": []
+            }
+            self._save()
+
+    async def toggle_participant(self, giveaway_id: str, user_id: int) -> tuple[bool, int, bool]:
+        """Agrega o retira participante. Retorna (success, total_count, is_joined)."""
+        async with self.lock:
+            gw = self.data.get("active", {}).get(giveaway_id)
+            if not gw:
+                return False, 0, False
+            participants = gw.setdefault("participants", [])
+            if user_id in participants:
+                participants.remove(user_id)
+                self._save()
+                return True, len(participants), False
+            else:
+                participants.append(user_id)
+                self._save()
+                return True, len(participants), True
+
+    def get_giveaway(self, giveaway_id: str) -> Optional[dict]:
+        return self.data.get("active", {}).get(giveaway_id)
+
+    def get_due_giveaways(self) -> list[dict]:
+        now = time.time()
+        due = []
+        for gw in list(self.data.get("active", {}).values()):
+            if now >= gw.get("end_time", 0):
+                due.append(gw)
+        return due
+
+    async def finish_giveaway(self, giveaway_id: str, winners: list[int]):
+        async with self.lock:
+            gw = self.data.get("active", {}).pop(giveaway_id, None)
+            if gw:
+                gw["winners"] = winners
+                gw["finished_at"] = time.time()
+                self.data.setdefault("history", []).append(gw)
+                self._save()
+
+
+# ==========================================
+# 💳 MÉTODOS DE PAGO Y REFERENCIAS DE CLIENTES
+# ==========================================
+
+def create_payment_methods_embed(guild: Optional[discord.Guild] = None) -> tuple[discord.Embed, discord.ui.View]:
+    """Genera el Embed oficial con métodos de pago listos para copiar."""
+    embed = discord.Embed(
+        title="💳 MÉTODOS DE PAGO OFICIALES • DENZEL XT 💵",
+        description=(
+            "¡Adquiere tus **Paneles de iOS**, **Proxies**, **Complex PC** y **BR Mods** con total seguridad!\n"
+            "Elige tu método de pago preferido y sigue las indicaciones:\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=discord.Color.from_rgb(0, 255, 170)
+    )
+
+    embed.add_field(
+        name="🪙 1. Binance Pay / USDT Cripto (0% Comisión)",
+        value=(
+            "• **Criptomoneda:** USDT (`Red TRC20` o `BEP20 / BSC`)\n"
+            "• **Binance Pay ID / Correo:**\n"
+            "```\nbinancedenzelxt@gmail.com\n```\n"
+            "*(También puedes solicitar el Pay ID numérico directo en este ticket)*"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🅿️ 2. PayPal Internacional",
+        value=(
+            "• **Modalidad Obligatoria:** Enviar únicamente como **\"Amigos y Familiares\"** (Friends & Family).\n"
+            "• **Correo / Link:** Solicita el enlace activo al vendedor en este ticket para evitar retenciones."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🇲🇽 3. México (Transferencia SPEI / Depósito OXXO)",
+        value=(
+            "• Depósito en efectivo en cualquier tienda **OXXO / 7-Eleven**.\n"
+            "• Transferencia bancaria directa vía **CLABE interbancaria (SPEI)** con acreditación inmediata."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🇨🇴 4. Colombia y Otros Países de Latinoamérica",
+        value=(
+            "• **Colombia:** Nequi, Bancolombia, Daviplata.\n"
+            "• **Internacional:** Western Union o transferencias locales.\n"
+            "• *(Consulta al vendedor en este ticket para recibir los datos de tu país)*"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚠️ PASOS TRAS REALIZAR EL PAGO:",
+        value=(
+            "1️⃣ Guarda tu comprobante o recibo de pago.\n"
+            "2️⃣ Envíalo como imagen aquí en tu ticket.\n"
+            "3️⃣ El staff verificará el abono y te entregará tu producto y rol VIP al instante."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="Denzel XT • Ventas oficiales • Atención Inmediata 24/7",
+        icon_url=guild.icon.url if (guild and guild.icon) else None
+    )
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="⭐ Dejar Referencia tras Recibir",
+            style=discord.ButtonStyle.success,
+            emoji="💎",
+            custom_id="ticket_btn_vouch"
+        )
+    )
+    return embed, view
+
+
+class ReviewModal(discord.ui.Modal, title="⭐ Calificar Servicio / Referencia"):
+    stars_input = discord.ui.TextInput(
+        label="Calificación en Estrellas (1 al 5):",
+        placeholder="Escribe un número del 1 al 5 (ej: 5)",
+        default="5",
+        min_length=1,
+        max_length=5,
+        required=True
+    )
+    product_input = discord.ui.TextInput(
+        label="Producto Adquirido:",
+        placeholder="Ej: Panel iOS, Complex PC, Proxy, Key BR Mods...",
+        style=discord.TextStyle.short,
+        min_length=2,
+        max_length=60,
+        required=True
+    )
+    comment_input = discord.ui.TextInput(
+        label="Tu Reseña u Opinión:",
+        placeholder="Describe la rapidez, atención recibida y funcionamiento del producto...",
+        style=discord.TextStyle.paragraph,
+        min_length=5,
+        max_length=800,
+        required=True
+    )
+    proof_input = discord.ui.TextInput(
+        label="Enlace de Captura / Prueba (Opcional):",
+        placeholder="https://... enlace de captura de pantalla o comprobante",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=250
+    )
+
+    def __init__(self, default_product: str = ""):
+        super().__init__()
+        if default_product:
+            self.product_input.default = default_product
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await handle_review_submission(
+            interaction=interaction,
+            stars_raw=self.stars_input.value,
+            product=self.product_input.value,
+            comment=self.comment_input.value,
+            proof_url=self.proof_input.value.strip() or None
+        )
+
+
+async def handle_review_submission(
+    interaction: discord.Interaction,
+    stars_raw: str,
+    product: str,
+    comment: str,
+    proof_url: Optional[str] = None,
+    attachment: Optional[discord.Attachment] = None
+):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ Esta función solo puede ejecutarse en el servidor.", ephemeral=True)
+        return
+
+    num_stars = 5
+    m = re.search(r'([1-5])', stars_raw)
+    if m:
+        num_stars = int(m.group(1))
+    elif "⭐" in stars_raw:
+        num_stars = max(1, min(5, stars_raw.count("⭐")))
+
+    stars_display = "⭐" * num_stars + f" ({num_stars}/5 Estrellas)"
+    rating_texts = {
+        5: "Excelente • Servicio Recomendado 🚀",
+        4: "Muy Bueno • Conforme 👍",
+        3: "Bueno • Aceptable 👌",
+        2: "Regular ⚠️",
+        1: "Insatisfecho ❌"
+    }
+    rating_desc = rating_texts.get(num_stars, "Verificado ✅")
+
+    embed = discord.Embed(
+        title="💎 NUEVA REFERENCIA DE CLIENTE VERIFICADA ⭐",
+        description=(
+            f"👤 **Cliente:** {interaction.user.mention} (`{interaction.user.name}`)\n"
+            f"⭐ **Calificación:** {stars_display}\n"
+            f"✨ **Experiencia:** *{rating_desc}*\n\n"
+            f"🛒 **Producto Adquirido:** **{product}**\n\n"
+            f"💬 **Reseña del Cliente:**\n"
+            f"*{comment}*"
+        ),
+        color=discord.Color.from_rgb(0, 230, 118),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(
+        text="Denzel XT • Referencias Oficiales • Compra 100% Segura y Verificada",
+        icon_url=guild.icon.url if guild.icon else None
+    )
+
+    if attachment:
+        embed.set_image(url=attachment.url)
+    elif proof_url and (proof_url.startswith("http://") or proof_url.startswith("https://")):
+        embed.set_image(url=proof_url)
+
+    target_channel = guild.get_channel(REFERENCES_CHANNEL_ID)
+    if not target_channel:
+        target_channel = (
+            discord.utils.get(guild.text_channels, name="💎𝐑𝐄𝐅𝐄𝐑𝐄𝐍𝐂𝐈𝐀𝐒")
+            or discord.utils.get(guild.text_channels, name="referencias")
+        )
+
+    if target_channel:
+        try:
+            await target_channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Error enviando reseña a canal de referencias: {e}")
+
+    if not interaction.response.is_done():
+        await interaction.response.send_message(
+            f"✅ **¡Muchas gracias por tu reseña, {interaction.user.mention}!**\n"
+            f"Tu calificación ha sido publicada en el canal oficial de referencias: <#{REFERENCES_CHANNEL_ID}> 💎",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            f"✅ **¡Muchas gracias por tu reseña!** Publicada en <#{REFERENCES_CHANNEL_ID}> 💎",
+            ephemeral=True
+        )
+
+    try:
+        bot_client = interaction.client
+        await bot_client.log_security_event(
+            guild=guild,
+            title="💎 Nueva Referencia de Cliente Registrada",
+            description=(
+                f"👤 **Cliente:** {interaction.user.mention} (`{interaction.user.name}`)\n"
+                f"⭐ **Calificación:** {stars_display}\n"
+                f"📦 **Producto:** `{product}`\n"
+                f"📝 **Comentario:** {comment[:120]}..."
+            ),
+            color=discord.Color.gold(),
+            thumbnail=interaction.user.display_avatar.url
+        )
+    except Exception as e:
+        logger.warning(f"Aviso registrando vouch en logs: {e}")
+
+
+# ==========================================
+# 🎁 VISTA INTERACTIVA DE SORTEOS CON BOTONES
+# ==========================================
+
+class GiveawayView(discord.ui.View):
+    """Vista interactiva con botón de participar y contador para sorteos."""
+    def __init__(self, giveaway_id: str, participant_count: int = 0):
+        super().__init__(timeout=None)
+        self.giveaway_id = giveaway_id
+
+        self.join_btn = discord.ui.Button(
+            label=f"🎉 Participar ({participant_count})",
+            style=discord.ButtonStyle.success,
+            custom_id=f"giveaway_join:{giveaway_id}"
+        )
+        self.join_btn.callback = self.join_callback
+        self.add_item(self.join_btn)
+
+        self.list_btn = discord.ui.Button(
+            label="👥 Participantes",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"giveaway_list:{giveaway_id}"
+        )
+        self.list_btn.callback = self.list_callback
+        self.add_item(self.list_btn)
+
+    async def join_callback(self, interaction: discord.Interaction):
+        await handle_giveaway_join(interaction, self.giveaway_id)
+
+    async def list_callback(self, interaction: discord.Interaction):
+        await handle_giveaway_list(interaction, self.giveaway_id)
+
+
+async def handle_giveaway_join(interaction: discord.Interaction, giveaway_id: str):
+    bot_client = interaction.client
+    success, total_count, is_joined = await bot_client.giveaway_manager.toggle_participant(giveaway_id, interaction.user.id)
+    if not success:
+        await interaction.response.send_message("❌ Este sorteo ya no se encuentra activo o ha finalizado.", ephemeral=True)
+        return
+
+    gw = bot_client.giveaway_manager.get_giveaway(giveaway_id)
+    prize = gw.get("prize", "Premio") if gw else "Premio"
+
+    try:
+        msg = interaction.message
+        if msg:
+            new_view = GiveawayView(giveaway_id, total_count)
+            if msg.embeds:
+                old_embed = msg.embeds[0]
+                new_embed = discord.Embed.from_dict(old_embed.to_dict())
+                for i, field in enumerate(new_embed.fields):
+                    if "Participantes" in field.name:
+                        new_embed.set_field_at(i, name=field.name, value=f"**{total_count} miembros**", inline=field.inline)
+                        break
+                await msg.edit(embed=new_embed, view=new_view)
+            else:
+                await msg.edit(view=new_view)
+    except Exception as e:
+        logger.warning(f"Aviso actualizando botón de sorteo: {e}")
+
+    if is_joined:
+        await interaction.response.send_message(
+            f"🎉 **¡Estás participando oficialmente en el sorteo!**\n"
+            f"🎁 **Premio:** **{prize}**\n"
+            f"👥 **Total de participantes:** **{total_count}**\n\n"
+            f"¡Mucha suerte! Te avisaremos si resultas ganador. 🍀",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"👋 Has cancelado tu participación en el sorteo de **{prize}**.",
+            ephemeral=True
+        )
+
+
+async def handle_giveaway_list(interaction: discord.Interaction, giveaway_id: str):
+    bot_client = interaction.client
+    gw = bot_client.giveaway_manager.get_giveaway(giveaway_id)
+    if not gw:
+        await interaction.response.send_message("❌ Este sorteo ya no se encuentra activo o ha finalizado.", ephemeral=True)
+        return
+
+    participants = gw.get("participants", [])
+    prize = gw.get("prize", "Premio")
+
+    if not participants:
+        await interaction.response.send_message(
+            f"ℹ️ **Sorteo:** {prize}\nActualmente no hay ningún miembro participando. ¡Sé el primero en hacer clic en **🎉 Participar**!",
+            ephemeral=True
+        )
+        return
+
+    member_mentions = [f"<@{uid}>" for uid in participants[:30]]
+    more = ""
+    if len(participants) > 30:
+        more = f"\n*... y {len(participants) - 30} participantes más.*"
+
+    embed = discord.Embed(
+        title=f"👥 Lista de Participantes ({len(participants)})",
+        description=(
+            f"🎁 **Premio:** **{prize}**\n\n"
+            f"**Participantes registrados:**\n"
+            + ", ".join(member_mentions)
+            + more
+        ),
+        color=discord.Color.from_rgb(0, 230, 118)
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class TicketCloseView(discord.ui.View):
-    """Botón persistente para cerrar el ticket con restricción de roles."""
+    """Botones persistentes en el ticket para cerrar, consultar pagos y calificar."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -581,7 +1082,8 @@ class TicketCloseView(discord.ui.View):
         label="Cerrar Ticket",
         style=discord.ButtonStyle.danger,
         emoji="🔒",
-        custom_id="ticket_btn_close"
+        custom_id="ticket_btn_close",
+        row=0
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Comprobar si el usuario tiene rol de Owner, Admin o Staff
@@ -599,6 +1101,33 @@ class TicketCloseView(discord.ui.View):
             view=confirm_view,
             ephemeral=True
         )
+
+    @discord.ui.button(
+        label="Métodos de Pago",
+        style=discord.ButtonStyle.primary,
+        emoji="💳",
+        custom_id="ticket_btn_payments",
+        row=0
+    )
+    async def view_payments(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed, view = create_payment_methods_embed(interaction.guild)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="Dejar Referencia",
+        style=discord.ButtonStyle.success,
+        emoji="⭐",
+        custom_id="ticket_btn_vouch",
+        row=0
+    )
+    async def leave_review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        default_prod = ""
+        if interaction.channel and getattr(interaction.channel, "topic", None):
+            topic = interaction.channel.topic
+            if "Producto:" in topic:
+                default_prod = topic.split("Producto:")[-1].strip()
+        modal = ReviewModal(default_product=default_prod)
+        await interaction.response.send_modal(modal)
 
 
 # ==========================================
@@ -759,6 +1288,19 @@ class DenzerVoiceBot(discord.Client):
         self.server_link_channel_id = SERVER_LINK_CHANNEL_ID
         self.permanent_invite_url = PERMANENT_INVITE_URL
         self.guild_id = GUILD_ID
+
+        # Canales y Roles Nuevos
+        self.references_channel_id = REFERENCES_CHANNEL_ID
+        self.lives_channel_id = LIVES_CHANNEL_ID
+        self.free_keys_channel_id = FREE_KEYS_CHANNEL_ID
+        self.customer_role_id = CUSTOMER_ROLE_ID
+        self.reseller_role_id = RESELLER_ROLE_ID
+
+        # Gestores de Crecimiento y Sorteos
+        self.invite_manager = InviteManager()
+        self.giveaway_manager = GiveawayManager()
+        self.invites_cache = {}
+
         self.connection_lock = asyncio.Lock()
         self.audio_queue = asyncio.Queue()
         self.is_playing_speech = False
@@ -787,7 +1329,34 @@ class DenzerVoiceBot(discord.Client):
 
         if interaction.type == discord.InteractionType.component and interaction.data:
             custom_id = interaction.data.get("custom_id", "")
-            if custom_id.startswith("bot_auth_verify:"):
+
+            # 1. BOTONES DE SORTEOS (PARTICIPAR / VER PARTICIPANTES)
+            if custom_id.startswith("giveaway_join:"):
+                gw_id = custom_id.split(":", 1)[1]
+                await handle_giveaway_join(interaction, gw_id)
+                return
+            elif custom_id.startswith("giveaway_list:"):
+                gw_id = custom_id.split(":", 1)[1]
+                await handle_giveaway_list(interaction, gw_id)
+                return
+
+            # 2. BOTONES EN TICKETS (PAGOS / REFERENCIA)
+            elif custom_id == "ticket_btn_payments":
+                embed, view = create_payment_methods_embed(interaction.guild)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            elif custom_id == "ticket_btn_vouch":
+                default_prod = ""
+                if interaction.channel and getattr(interaction.channel, "topic", None):
+                    topic = interaction.channel.topic
+                    if "Producto:" in topic:
+                        default_prod = topic.split("Producto:")[-1].strip()
+                modal = ReviewModal(default_product=default_prod)
+                await interaction.response.send_modal(modal)
+                return
+
+            # 3. VERIFICACIÓN Y AUTORIZACIÓN DE BOTS
+            elif custom_id.startswith("bot_auth_verify:"):
                 try:
                     bot_id = int(custom_id.split(":")[1])
                 except Exception:
@@ -1045,6 +1614,417 @@ class DenzerVoiceBot(discord.Client):
             await target.send(embed=embed, view=view)
             await interaction.response.send_message(f"✅ Anuncio de compra publicado con éxito en {target.mention}.", ephemeral=True)
 
+        # 1. COMANDO /pagos
+        @self.tree.command(name="pagos", description="Muestra los métodos de pago oficiales de Denzel XT con datos para copiar")
+        async def pagos_cmd(interaction: discord.Interaction):
+            embed, view = create_payment_methods_embed(interaction.guild)
+            await interaction.response.send_message(embed=embed, view=view)
+
+        # 2. COMANDO /referencia
+        @self.tree.command(name="referencia", description="Deja tu reseña y calificación del servicio y productos de Denzel XT")
+        @app_commands.describe(
+            estrellas="Calificación de 1 a 5 estrellas",
+            producto="Producto adquirido (ej: Panel iOS, Complex PC, BR Mods, Proxy)",
+            comentario="Tu opinión sobre la atención y el producto recibido",
+            captura="Captura de pantalla o comprobante opcional de tu entrega/juego"
+        )
+        @app_commands.choices(estrellas=[
+            app_commands.Choice(name="⭐⭐⭐⭐⭐ 5 Estrellas (Excelente)", value="5"),
+            app_commands.Choice(name="⭐⭐⭐⭐ 4 Estrellas (Muy Bueno)", value="4"),
+            app_commands.Choice(name="⭐⭐⭐ 3 Estrellas (Bueno)", value="3"),
+            app_commands.Choice(name="⭐⭐ 2 Estrellas (Regular)", value="2"),
+            app_commands.Choice(name="⭐ 1 Estrella (Malo)", value="1"),
+        ])
+        async def referencia_cmd(
+            interaction: discord.Interaction,
+            estrellas: app_commands.Choice[str],
+            producto: str,
+            comentario: str,
+            captura: Optional[discord.Attachment] = None
+        ):
+            await handle_review_submission(
+                interaction=interaction,
+                stars_raw=estrellas.value,
+                product=producto,
+                comment=comentario,
+                proof_url=None,
+                attachment=captura
+            )
+
+        # 3. COMANDO /entregar
+        @self.tree.command(name="entregar", description="Entrega un producto al cliente, le asigna rol VIP y envía botón de reseña")
+        @app_commands.describe(
+            cliente="Miembro al que se le entregó el producto",
+            producto="Nombre del producto entregado (ej: Panel iOS Mes, Complex PC Perma, Key BR Mods)",
+            nota="Mensaje o instrucción adicional para el cliente (opcional)"
+        )
+        async def entregar_cmd(
+            interaction: discord.Interaction,
+            cliente: discord.Member,
+            producto: str,
+            nota: Optional[str] = None
+        ):
+            if not is_user_staff_or_owner(interaction.user, interaction.guild):
+                await interaction.response.send_message(
+                    "⛔ **Acceso Denegado:** Solo los miembros del **Staff / Vendedores** pueden utilizar el comando de entrega.",
+                    ephemeral=True
+                )
+                return
+
+            guild = interaction.guild
+            customer_role = guild.get_role(self.customer_role_id) if guild else None
+            role_assigned_text = "Rol no configurado"
+
+            if customer_role and cliente:
+                try:
+                    if customer_role not in cliente.roles:
+                        await cliente.add_roles(customer_role, reason=f"Entrega de producto por {interaction.user.name}")
+                    role_assigned_text = f"{customer_role.mention} ✅"
+                except Exception as e:
+                    role_assigned_text = f"Error asignando rol ({e})"
+
+            if "br" in producto.lower() or "reseller" in producto.lower():
+                reseller_role = guild.get_role(self.reseller_role_id) if guild else None
+                if reseller_role and cliente and reseller_role not in cliente.roles:
+                    try:
+                        await cliente.add_roles(reseller_role, reason=f"Rol Reseller por {interaction.user.name}")
+                    except Exception:
+                        pass
+
+            embed = discord.Embed(
+                title="🎉 ¡ENTREGA COMPLETADA CON ÉXITO! 💸",
+                description=(
+                    f"👋 ¡Muchas gracias por tu compra en **Denzel XT**!\n\n"
+                    f"👤 **Cliente:** {cliente.mention} (`{cliente.name}`)\n"
+                    f"📦 **Producto Entregado:** **{producto}**\n"
+                    f"👑 **Vendedor:** {interaction.user.mention}\n"
+                    f"🎖️ **Rango Otorgado:** {role_assigned_text}\n"
+                    + (f"💬 **Nota del Vendedor:** *{nota}*\n\n" if nota else "\n") +
+                    f"⭐ **¿Qué tal fue tu experiencia?**\n"
+                    f"Por favor ayuda a la comunidad dejando tu calificación y reseña con el botón verde de abajo:"
+                ),
+                color=discord.Color.from_rgb(0, 255, 170),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_thumbnail(url=cliente.display_avatar.url)
+            embed.set_footer(
+                text="Denzel XT • Garantía y Soporte 24/7",
+                icon_url=guild.icon.url if (guild and guild.icon) else None
+            )
+
+            view = discord.ui.View(timeout=None)
+            view.add_item(
+                discord.ui.Button(
+                    label="⭐ Dejar Referencia / Calificar",
+                    style=discord.ButtonStyle.success,
+                    emoji="💎",
+                    custom_id="ticket_btn_vouch"
+                )
+            )
+
+            if os.path.exists(BANNER_IMAGE_PATH):
+                file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                embed.set_image(url="attachment://denzel_banner.jpg")
+                await interaction.channel.send(content=f"🎉 {cliente.mention}", file=file, embed=embed, view=view)
+            else:
+                await interaction.channel.send(content=f"🎉 {cliente.mention}", embed=embed, view=view)
+
+            await interaction.response.send_message(
+                f"✅ Entrega de **{producto}** registrada correctamente para {cliente.mention}.",
+                ephemeral=True
+            )
+
+            try:
+                await self.log_security_event(
+                    guild=guild,
+                    title="💰 Venta Registrada & Producto Entregado",
+                    description=(
+                        f"👤 **Cliente:** {cliente.mention} (`{cliente.name}` - `{cliente.id}`)\n"
+                        f"📦 **Producto:** `{producto}`\n"
+                        f"👑 **Vendedor:** {interaction.user.mention}\n"
+                        f"📁 **Canal:** {interaction.channel.mention}"
+                    ),
+                    color=discord.Color.green(),
+                    thumbnail=cliente.display_avatar.url
+                )
+            except Exception as e:
+                logger.warning(f"Aviso registrando entrega en logs: {e}")
+
+        # 4. COMANDO /invites
+        @self.tree.command(name="invites", description="Consulta cuántas personas ha invitado un usuario al servidor")
+        @app_commands.describe(usuario="Usuario a consultar (opcional, por defecto tú mismo)")
+        async def invites_cmd(interaction: discord.Interaction, usuario: Optional[discord.Member] = None):
+            target = usuario or interaction.user
+            stats = self.invite_manager.get_stats(target.id)
+            total = stats.get("total", 0)
+            active = stats.get("active", 0)
+            leaves = stats.get("leaves", 0)
+
+            embed = discord.Embed(
+                title=f"🎟️ Contador de Invitaciones | Denzel XT",
+                description=(
+                    f"Estadísticas de invitaciones oficiales de {target.mention}:\n\n"
+                    f"📈 **Total Invitados:** **{total} miembros**\n"
+                    f"✅ **Miembros Activos:** **{active} miembros**\n"
+                    f"🚪 **Miembros que Salieron:** **{leaves}**\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎁 **RECOMPENSAS POR INVITAR:**\n"
+                    f"• 🎟️ **5 Invitaciones:** Key de 1 Día de **BR Mods** en <#{self.free_keys_channel_id}>\n"
+                    f"• 💎 **10 Invitaciones:** Descuento del **20%** en cualquier Panel VIP\n"
+                    f"• 🚀 **20 Invitaciones:** Key **Semanal Completa** de Complex PC o BR Mods"
+                ),
+                color=discord.Color.from_rgb(0, 230, 118)
+            )
+            embed.set_thumbnail(url=target.display_avatar.url)
+            embed.set_footer(
+                text="Denzel XT • Invita amigos y gana recompensas semanales",
+                icon_url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None
+            )
+            await interaction.response.send_message(embed=embed)
+
+        # 5. COMANDO /top_invites
+        @self.tree.command(name="top_invites", description="Muestra el Ranking Top 10 de miembros con más invitaciones en el servidor")
+        async def top_invites_cmd(interaction: discord.Interaction):
+            top_list = self.invite_manager.get_top_inviters(limit=10)
+            guild = interaction.guild
+
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            lines = []
+            for i, (uid, stats) in enumerate(top_list):
+                medal = medals[i] if i < len(medals) else f"`#{i+1}`"
+                user = guild.get_member(uid) if guild else None
+                name_str = user.mention if user else f"`ID {uid}`"
+                act = stats.get("active", 0)
+                tot = stats.get("total", 0)
+                lines.append(f"{medal} {name_str} — **{act} activos** *(Total: {tot})*")
+
+            if not lines:
+                lines.append("Aún no hay invitaciones registradas en el nuevo sistema.")
+
+            embed = discord.Embed(
+                title="🏆 TOP 10 INVITADORES DEL SERVIDOR 🏆",
+                description=(
+                    "¡Los miembros que más están haciendo crecer a la comunidad de **Denzel XT**!\n\n"
+                    + "\n".join(lines) + "\n\n"
+                    f"👉 ¡Usa `/invites` para ver tus invitaciones y ganar keys gratis!"
+                ),
+                color=discord.Color.gold(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_footer(
+                text="Denzel XT • Ranking Oficial de Crecimiento",
+                icon_url=guild.icon.url if guild and guild.icon else None
+            )
+            await interaction.response.send_message(embed=embed)
+
+        # 6. COMANDO /sorteo
+        @self.tree.command(name="sorteo", description="Crea un sorteo interactivo con botón de participar y contador para keys")
+        @app_commands.describe(
+            premio="Premio a sortear (ej: Key Semanal BR Mods, Key 1 Día Complex PC)",
+            minutos="Duración del sorteo en minutos (ej: 60 para 1 hora, 1440 para 24 horas)",
+            ganadores="Cantidad de ganadores a elegir al azar (por defecto 1)",
+            canal="Canal donde publicar el sorteo (por defecto el canal de Keys Gratis)"
+        )
+        async def sorteo_cmd(
+            interaction: discord.Interaction,
+            premio: str,
+            minutos: int,
+            ganadores: Optional[int] = 1,
+            canal: Optional[discord.TextChannel] = None
+        ):
+            if not is_user_staff_or_owner(interaction.user, interaction.guild):
+                await interaction.response.send_message(
+                    "⛔ **Acceso Denegado:** Solo los miembros del **Staff u Owner** pueden iniciar sorteos.",
+                    ephemeral=True
+                )
+                return
+
+            target_ch = (
+                canal
+                or interaction.guild.get_channel(self.free_keys_channel_id)
+                or discord.utils.get(interaction.guild.text_channels, name="𝙆𝙀𝙔-𝙂𝙍𝘼𝙏𝙄𝙎-𝘽𝙍-𝙈𝙊𝘿𝙎")
+                or discord.utils.get(interaction.guild.text_channels, name="𝙆𝙀𝙔𝙎-𝙂𝙍𝘼𝙏𝙄𝙎")
+                or interaction.channel
+            )
+            now = time.time()
+            duration_sec = max(60, minutos * 60)
+            end_time = now + duration_sec
+            end_timestamp = int(end_time)
+            gw_id = f"gw_{int(now)}_{random.randint(100, 999)}"
+            winners_count = max(1, ganadores or 1)
+
+            embed = discord.Embed(
+                title="🎉 ¡SORTEO OFICIAL DE KEY / MEMBRESÍA! 🎉",
+                description=(
+                    f"¡Participa por una **{premio}** totalmente gratis!\n\n"
+                    f"🎁 **Premio:** **{premio}**\n"
+                    f"🏆 **Ganadores:** **{winners_count}**\n"
+                    f"👑 **Organizado por:** {interaction.user.mention}\n"
+                    f"⏰ **Finaliza en:** <t:{end_timestamp}:R> (<t:{end_timestamp}:F>)\n"
+                    f"👥 **Participantes:** **0 miembros**\n\n"
+                    f"👉 **¿Cómo participar?**\n"
+                    f"Solo presiona el botón verde **🎉 Participar** de abajo. ¡El bot elegirá a los ganadores de forma 100% transparente y automática!"
+                ),
+                color=discord.Color.from_rgb(0, 255, 136),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_footer(
+                text="Denzel XT • Sorteos Oficiales • 100% Transparente",
+                icon_url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None
+            )
+
+            view = GiveawayView(giveaway_id=gw_id, participant_count=0)
+
+            if os.path.exists(BANNER_IMAGE_PATH):
+                file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                embed.set_image(url="attachment://denzel_banner.jpg")
+                gw_msg = await target_ch.send(content="🎉 @everyone ¡HAY UN NUEVO SORTEO ACTIVO! 🎉", file=file, embed=embed, view=view)
+            else:
+                gw_msg = await target_ch.send(content="🎉 @everyone ¡HAY UN NUEVO SORTEO ACTIVO! 🎉", embed=embed, view=view)
+
+            await self.giveaway_manager.create_giveaway(
+                giveaway_id=gw_id,
+                channel_id=target_ch.id,
+                message_id=gw_msg.id,
+                prize=premio,
+                winners_count=winners_count,
+                host_id=interaction.user.id,
+                end_time=end_time
+            )
+
+            await interaction.response.send_message(
+                f"✅ Sorteo de **{premio}** publicado exitosamente en {target_ch.mention}.\n"
+                f"Duración: **{minutos} minutos** | Ganadores: **{winners_count}**",
+                ephemeral=True
+            )
+
+            try:
+                await self.log_security_event(
+                    guild=interaction.guild,
+                    title="🎉 Nuevo Sorteo Iniciado",
+                    description=(
+                        f"🎁 **Premio:** `{premio}`\n"
+                        f"👑 **Organizador:** {interaction.user.mention}\n"
+                        f"📁 **Canal:** {target_ch.mention}\n"
+                        f"⏰ **Duración:** {minutos} minutos ({winners_count} ganadores)"
+                    ),
+                    color=discord.Color.green()
+                )
+            except Exception as e:
+                logger.warning(f"Aviso registrando sorteo en logs: {e}")
+
+        # 7. COMANDO /alerta_live
+        @self.tree.command(name="alerta_live", description="Publica una alerta en tiempo real de directo en TikTok, YouTube, Twitch o Kick")
+        @app_commands.describe(
+            plataforma="Plataforma donde se transmite el directo",
+            titulo="Título o temática de la transmisión en vivo",
+            enlace="Enlace directo a la transmisión (TikTok, YouTube, Twitch, etc.)",
+            mencion="Mención para alertar a los miembros"
+        )
+        @app_commands.choices(
+            plataforma=[
+                app_commands.Choice(name="📱 TikTok Live", value="TikTok Live"),
+                app_commands.Choice(name="🔴 YouTube Live", value="YouTube Live"),
+                app_commands.Choice(name="🟣 Twitch", value="Twitch"),
+                app_commands.Choice(name="🟢 Kick", value="Kick")
+            ],
+            mencion=[
+                app_commands.Choice(name="📢 @everyone (Toda la comunidad)", value="@everyone"),
+                app_commands.Choice(name="🔔 @here (Solo miembros conectados)", value="@here"),
+                app_commands.Choice(name="🎙️ Rol STREMER X", value="<@&1552827044012888095>"),
+                app_commands.Choice(name="🔇 Sin mención", value="none")
+            ]
+        )
+        async def alerta_live_cmd(
+            interaction: discord.Interaction,
+            plataforma: app_commands.Choice[str],
+            titulo: str,
+            enlace: str,
+            mencion: Optional[app_commands.Choice[str]] = None
+        ):
+            if not is_user_staff_or_owner(interaction.user, interaction.guild):
+                await interaction.response.send_message(
+                    "⛔ **Acceso Denegado:** Solo los miembros del **Staff / Streamers** pueden enviar alertas de directo.",
+                    ephemeral=True
+                )
+                return
+
+            guild = interaction.guild
+            target_ch = (
+                guild.get_channel(self.lives_channel_id)
+                or discord.utils.get(guild.text_channels, name="𝐋𝐈𝐕𝐄𝐒")
+                or interaction.channel
+            )
+
+            platform_colors = {
+                "TikTok Live": discord.Color.from_rgb(254, 44, 85),
+                "YouTube Live": discord.Color.from_rgb(255, 0, 0),
+                "Twitch": discord.Color.from_rgb(145, 70, 255),
+                "Kick": discord.Color.from_rgb(83, 252, 24)
+            }
+            chosen_color = platform_colors.get(plataforma.value, discord.Color.red())
+
+            embed = discord.Embed(
+                title="🔴 ¡ESTAMOS EN DIRECTO AHORA MISMO! 🔴",
+                description=(
+                    f"🔥 **{interaction.user.name}** ha comenzado transmisión en vivo.\n\n"
+                    f"📱 **Plataforma:** **{plataforma.value}**\n"
+                    f"🎮 **Transmisión:** **{titulo}**\n\n"
+                    f"🚀 **¡Entra ya para apoyar, jugar salas y ganar keys en vivo!**\n"
+                    f"👉 Presiona el botón de abajo para unirte al directo inmediatamente."
+                ),
+                color=chosen_color,
+                timestamp=discord.utils.utcnow()
+            )
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            embed.set_footer(
+                text=f"Denzel XT • Alertas Oficiales de Directo • {plataforma.value}",
+                icon_url=guild.icon.url if guild and guild.icon else None
+            )
+
+            view = discord.ui.View()
+            view.add_item(
+                discord.ui.Button(
+                    label="🔴 ENTRAR AL DIRECTO AHORA",
+                    url=enlace.strip(),
+                    style=discord.ButtonStyle.link,
+                    emoji="🔥"
+                )
+            )
+
+            ping_content = ""
+            if mencion and mencion.value != "none":
+                ping_content = f"{mencion.value} 🔴 **¡ESTAMOS EN VIVO!**"
+            else:
+                ping_content = "@everyone 🔴 **¡ESTAMOS EN VIVO!**"
+
+            if os.path.exists(BANNER_IMAGE_PATH):
+                file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                embed.set_image(url="attachment://denzel_banner.jpg")
+                await target_ch.send(content=ping_content, file=file, embed=embed, view=view)
+            else:
+                await target_ch.send(content=ping_content, embed=embed, view=view)
+
+            await interaction.response.send_message(
+                f"✅ Alerta de directo publicada exitosamente en {target_ch.mention}.",
+                ephemeral=True
+            )
+
+            try:
+                await self.log_security_event(
+                    guild=guild,
+                    title="📱 Alerta de Directo Publicada",
+                    description=(
+                        f"📱 **Plataforma:** `{plataforma.value}`\n"
+                        f"🎮 **Título:** `{titulo}`\n"
+                        f"🔗 **Enlace:** {enlace}\n"
+                        f"👤 **Streamer:** {interaction.user.mention}"
+                    ),
+                    color=chosen_color
+                )
+            except Exception as e:
+                logger.warning(f"Aviso registrando live en logs: {e}")
+
     async def start_cloud_health_server(self):
         """Servidor HTTP liviano para Railway/Render."""
         try:
@@ -1073,6 +2053,9 @@ class DenzerVoiceBot(discord.Client):
         logger.info(f"🛡️ Canal de Logs de Seguridad 24/7: {self.security_logs_channel_id}")
         logger.info(f"👋 Canal de Bienvenida: {self.welcome_channel_id}")
         logger.info(f"👋 Canal de Despedida: {self.leave_channel_id}")
+        logger.info(f"💎 Canal de Referencias: {self.references_channel_id}")
+        logger.info(f"📱 Canal de Lives: {self.lives_channel_id}")
+        logger.info(f"🎁 Canal de Keys Gratis / Sorteos: {self.free_keys_channel_id}")
         logger.info("🛒 Sistema de Tickets de Compra con Precios: Activo")
         logger.info("🔒 Restricción de Cierre de Tickets (Solo Staff/Owner): Activo")
         logger.info("🛡️ Suite de Protección (Anti-Nuke, Anti-Raid, Anti-Scam): Activa")
@@ -1080,6 +2063,15 @@ class DenzerVoiceBot(discord.Client):
 
         # Iniciar servidor web de salud para Railway si aplica
         await self.start_cloud_health_server()
+
+        # Cachear invitaciones de servidores para tracking
+        for g in self.guilds:
+            try:
+                invs = await g.invites()
+                self.invites_cache[g.id] = {inv.code: inv.uses for inv in invs}
+                logger.info(f"🎟️ {len(invs)} invitaciones cacheadas en {g.name}.")
+            except Exception as e:
+                logger.warning(f"Aviso al cachear invitaciones: {e}")
 
         # Asegurar canal de seguridad y logs 24/7 (situado arriba de anuncios)
         target_guild = self.get_guild(self.guild_id)
@@ -1097,7 +2089,7 @@ class DenzerVoiceBot(discord.Client):
             guild_obj = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild_obj)
             await self.tree.sync(guild=guild_obj)
-            logger.info("⚡ Comandos Slash sincronizados (/tts, /panel_tickets, /enviar_anuncio).")
+            logger.info("⚡ Comandos Slash sincronizados (/tts, /panel_tickets, /enviar_anuncio, /pagos, /referencia, /entregar, /invites, /top_invites, /sorteo, /alerta_live).")
         except Exception as e:
             logger.warning(f"Aviso al sincronizar slash commands: {e}")
 
@@ -1110,6 +2102,8 @@ class DenzerVoiceBot(discord.Client):
             self.audio_worker.start()
         if not self.status_rotator.is_running():
             self.status_rotator.start()
+        if not self.giveaway_checker.is_running():
+            self.giveaway_checker.start()
 
     async def ensure_voice_connection(self):
         """Asegura la conexión al canal de voz de forma segura."""
@@ -1583,6 +2577,13 @@ class DenzerVoiceBot(discord.Client):
                 return
 
         # Salida normal de miembro
+        try:
+            inviter_id = await self.invite_manager.record_leave(member.id)
+            if inviter_id:
+                logger.info(f"🚪 Miembro {member.name} salió. Descontado de inviter ID {inviter_id}")
+        except Exception as e:
+            logger.warning(f"Aviso actualizando invitaciones en salida: {e}")
+
         await self.log_security_event(
             guild=guild,
             title="📤 Miembro ha Salido del Servidor",
@@ -1672,12 +2673,34 @@ class DenzerVoiceBot(discord.Client):
                 )
             return
 
+        # Rastrear invitación del nuevo miembro
+        inviter = None
+        try:
+            current_invs = await guild.invites()
+            cached = self.invites_cache.get(guild.id, {})
+            for inv in current_invs:
+                if inv.uses > cached.get(inv.code, 0):
+                    inviter = inv.inviter
+                    break
+            self.invites_cache[guild.id] = {inv.code: inv.uses for inv in current_invs}
+        except Exception as e:
+            logger.debug(f"Aviso revisando invitación de nuevo miembro: {e}")
+
+        if inviter and not inviter.bot and inviter.id != member.id:
+            try:
+                await self.invite_manager.record_join(inviter.id, member.id)
+                logger.info(f"🎟️ {member.name} ingresó mediante invitación de {inviter.name} ({inviter.id})")
+            except Exception as e:
+                logger.warning(f"Aviso registrando invitador: {e}")
+
         # Entrada de usuario normal: registrar en logs 24/7
+        inviter_line = f"👤 Invitado por: {inviter.mention}\n" if inviter else ""
         await self.log_security_event(
             guild=guild,
             title="📥 Nuevo Miembro Unido",
             description=(
                 f"👤 {member.mention} (`{member.name}` - `{member.id}`)\n"
+                + inviter_line +
                 f"📅 Cuenta creada: <t:{int(member.created_at.timestamp())}:R>\n"
                 f"👥 Total de miembros: **{guild.member_count}**"
             ),
@@ -1691,9 +2714,14 @@ class DenzerVoiceBot(discord.Client):
             if not welcome_ch:
                 welcome_ch = await guild.fetch_channel(self.welcome_channel_id)
             if welcome_ch:
+                welcome_desc = (
+                    f"¡Bienvenido {member.mention}! Eres el miembro **#{guild.member_count}**.\n"
+                    + (f"👤 **Invitado por:** {inviter.mention}\n" if inviter else "") +
+                    "Esperamos que disfrutes la comunidad y nuestros productos."
+                )
                 embed_welcome = discord.Embed(
                     title="👋 Bienvenido a 𝑫𝒆𝒏𝒛𝒆𝒍 𝑿𝕿 💵",
-                    description=f"¡Bienvenido {member.mention}! Eres el miembro **#{guild.member_count}**. Esperamos que disfrutes la comunidad.",
+                    description=welcome_desc,
                     color=discord.Color.from_rgb(88, 101, 242)
                 )
                 embed_welcome.set_thumbnail(url=member.display_avatar.url)
@@ -1962,10 +2990,123 @@ class DenzerVoiceBot(discord.Client):
         except Exception as e:
             logger.debug(f"Error rotando estado: {e}")
 
+    @tasks.loop(seconds=15)
+    async def giveaway_checker(self):
+        """Verifica sorteos activos y sortea automáticamente ganadores al vencer el tiempo."""
+        try:
+            due_list = self.giveaway_manager.get_due_giveaways()
+            for gw in due_list:
+                await self.resolve_giveaway(gw)
+        except Exception as e:
+            logger.error(f"Error en giveaway_checker loop: {e}", exc_info=True)
+
+    async def resolve_giveaway(self, gw: dict):
+        """Elige ganadores al azar, actualiza el mensaje y publica el anuncio oficial."""
+        giveaway_id = gw["id"]
+        channel_id = gw["channel_id"]
+        message_id = gw["message_id"]
+        prize = gw["prize"]
+        winners_count = gw.get("winners_count", 1)
+        participants = gw.get("participants", [])
+
+        guild = self.get_guild(self.guild_id)
+        if not guild:
+            return
+
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+
+        winners = []
+        if participants:
+            k = min(winners_count, len(participants))
+            winners = random.sample(participants, k)
+
+        await self.giveaway_manager.finish_giveaway(giveaway_id, winners)
+
+        if channel:
+            try:
+                msg = await channel.fetch_message(message_id)
+                if msg and msg.embeds:
+                    old_embed = msg.embeds[0]
+                    new_embed = discord.Embed.from_dict(old_embed.to_dict())
+                    new_embed.title = "🎉 ¡SORTEO FINALIZADO! 🎉"
+                    new_embed.color = discord.Color.gold()
+
+                    if winners:
+                        winners_mentions = ", ".join([f"<@{w}>" for w in winners])
+                        new_embed.description = (
+                            f"🎁 **Premio Sorteado:** **{prize}**\n\n"
+                            f"🏆 **¡Ganadores Oficiales!**\n"
+                            f"{winners_mentions}\n\n"
+                            f"👥 **Total de participantes:** **{len(participants)}**\n"
+                            f"✨ ¡Felicitaciones a los ganadores! Abran ticket en <#{self.ticket_channel_id}> para reclamar su key."
+                        )
+                    else:
+                        new_embed.description = (
+                            f"🎁 **Premio Sorteado:** **{prize}**\n\n"
+                            f"⚠️ **Sorteo finalizado sin participantes.**\n"
+                            f"No hubo miembros inscritos para este sorteo."
+                        )
+
+                    disabled_view = discord.ui.View()
+                    disabled_view.add_item(
+                        discord.ui.Button(
+                            label=f"Sorteo Terminado ({len(participants)} Participantes)",
+                            style=discord.ButtonStyle.secondary,
+                            disabled=True
+                        )
+                    )
+                    await msg.edit(embed=new_embed, view=disabled_view)
+            except Exception as e:
+                logger.warning(f"Aviso actualizando mensaje de sorteo: {e}")
+
+            if winners:
+                winners_pings = " ".join([f"<@{w}>" for w in winners])
+                try:
+                    announce_embed = discord.Embed(
+                        title="🎊 ¡TENEMOS GANADORES DEL SORTEO! 🎊",
+                        description=(
+                            f"🎉 ¡Felicitaciones a los afortunados ganadores de **{prize}**!\n\n"
+                            f"🏆 **Ganadores:**\n"
+                            + "\n".join([f"• <@{w}>" for w in winners]) + "\n\n"
+                            f"🎫 **¿Cómo reclamar tu key?**\n"
+                            f"Por favor abre un ticket inmediatamente en <#{self.ticket_channel_id}> para entregarte tu key oficial."
+                        ),
+                        color=discord.Color.from_rgb(0, 255, 170),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    if os.path.exists(BANNER_IMAGE_PATH):
+                        file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                        announce_embed.set_image(url="attachment://denzel_banner.jpg")
+                        await channel.send(content=f"🎉 {winners_pings}", file=file, embed=announce_embed)
+                    else:
+                        await channel.send(content=f"🎉 {winners_pings}", embed=announce_embed)
+                except Exception as e:
+                    logger.warning(f"Aviso enviando anuncio de ganadores: {e}")
+
+        try:
+            await self.log_security_event(
+                guild=guild,
+                title="🎉 Sorteo Finalizado & Ganadores Elegidos",
+                description=(
+                    f"🎁 **Premio:** `{prize}`\n"
+                    f"🏆 **Ganadores ({len(winners)}):** " + (", ".join([f"<@{w}>" for w in winners]) if winners else "Ninguno") + "\n"
+                    f"👥 **Participantes:** {len(participants)}"
+                ),
+                color=discord.Color.gold()
+            )
+        except Exception as e:
+            logger.warning(f"Aviso registrando sorteo en logs: {e}")
+
     @voice_watchdog.before_loop
     @voice_keepalive.before_loop
     @audio_worker.before_loop
     @status_rotator.before_loop
+    @giveaway_checker.before_loop
     async def before_tasks(self):
         await self.wait_until_ready()
 

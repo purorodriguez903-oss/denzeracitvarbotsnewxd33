@@ -25,3 +25,7 @@ ENV/
 
 # Logs del sistema
 *.log
+
+# Datos persistentes de runtime
+data/*.json
+data/*.tmp
