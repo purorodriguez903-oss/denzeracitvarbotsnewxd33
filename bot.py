@@ -48,6 +48,25 @@ PORT = int(os.getenv("PORT", "8080"))
 BOT_AUTH_PASSWORD = "rafaxd"
 INVITE_REGEX = re.compile(r'(?:https?:\/\/)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com\/invite)\/([a-zA-Z0-9\-]+)', re.IGNORECASE)
 
+# Banner oficial para bienvenidas y despedidas
+BANNER_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "denzel_banner.jpg")
+
+def format_account_age(created_at: datetime.datetime) -> str:
+    """Calcula la antigüedad de la cuenta en español."""
+    now = discord.utils.utcnow()
+    delta = now - created_at
+    days = delta.days
+    if days < 1:
+        return "hoy"
+    elif days < 30:
+        return f"{days} días"
+    elif days < 365:
+        months = days // 30
+        return f"{months} mes" if months == 1 else f"{months} meses"
+    else:
+        years = days // 365
+        return f"{years} año" if years == 1 else f"{years} años"
+
 # Huellas digitales de la imagen de estafa (MrBeast / Casino Crypto)
 SCAM_IMAGE_DHASH = 0x9c6c89976da4247d
 SCAM_IMAGE_AHASH = 0x63678c084f4939f
@@ -1043,64 +1062,6 @@ class DenzerVoiceBot(discord.Client):
         except Exception as e:
             logger.debug(f"Aviso servidor de salud HTTP: {e}")
 
-    async def ensure_server_link_published(self):
-        """Verifica o publica el mensaje con el enlace permanente en el canal designado."""
-        try:
-            channel = self.get_channel(self.server_link_channel_id)
-            if not channel:
-                try:
-                    channel = await self.fetch_channel(self.server_link_channel_id)
-                except Exception as e:
-                    logger.warning(f"⚠️ No se pudo acceder al canal de enlace permanente (ID: {self.server_link_channel_id}): {e}")
-                    return
-
-            link_found = False
-            async for msg in channel.history(limit=20):
-                if msg.author.id == self.user.id and msg.embeds:
-                    for emb in msg.embeds:
-                        if emb.title and "ENLACE OFICIAL DE DENZEL XT" in emb.title:
-                            link_found = True
-                            break
-                if link_found:
-                    break
-
-            if not link_found:
-                embed = discord.Embed(
-                    title="🌐 ENLACE OFICIAL DE DENZEL XT 💸",
-                    description=(
-                        "¡Invita a tus amigos y comparte nuestro servidor oficial! 🚀\n\n"
-                        "🔗 **Enlace Permanente Oficial:**\n"
-                        f"👉 **{self.permanent_invite_url}**\n\n"
-                        "✨ **Beneficios:**\n"
-                        "• Enlace 100% activo sin límite de tiempo ni caducidad.\n"
-                        "• Acceso a paneles de iOS/PC, proxies, sorteos, salas de voz 24/7 y la mejor comunidad."
-                    ),
-                    color=discord.Color.from_rgb(0, 230, 255)
-                )
-                embed.set_footer(
-                    text="Denzel XT • Invitación Permanente 24/7",
-                    icon_url=channel.guild.icon.url if channel.guild and channel.guild.icon else None
-                )
-
-                view = discord.ui.View()
-                view.add_item(
-                    discord.ui.Button(
-                        label="🌐 Unirse / Compartir Servidor",
-                        url=self.permanent_invite_url,
-                        style=discord.ButtonStyle.link,
-                        emoji="🚀"
-                    )
-                )
-
-                await channel.send(
-                    content=f"📌 **Enlace Oficial del Servidor:** {self.permanent_invite_url}",
-                    embed=embed,
-                    view=view
-                )
-                logger.info(f"🔗 Enlace permanente publicado con éxito en #{channel.name} ({channel.id}).")
-        except Exception as e:
-            logger.error(f"❌ Error publicando enlace permanente del servidor: {e}")
-
     async def on_ready(self):
         logger.info("=" * 65)
         logger.info(f"🟢 BOT EN LÍNEA: {self.user.name} ({self.user.id})")
@@ -1110,7 +1071,6 @@ class DenzerVoiceBot(discord.Client):
         logger.info(f"🛡️ Canal de Logs de Seguridad 24/7: {self.security_logs_channel_id}")
         logger.info(f"👋 Canal de Bienvenida: {self.welcome_channel_id}")
         logger.info(f"👋 Canal de Despedida: {self.leave_channel_id}")
-        logger.info(f"🔗 Canal Enlace Permanente: {self.server_link_channel_id}")
         logger.info("🛒 Sistema de Tickets de Compra con Precios: Activo")
         logger.info("🔒 Restricción de Cierre de Tickets (Solo Staff/Owner): Activo")
         logger.info("🛡️ Suite de Protección (Anti-Nuke, Anti-Raid, Anti-Scam): Activa")
@@ -1129,9 +1089,6 @@ class DenzerVoiceBot(discord.Client):
 
         # Asegurar que el anuncio de venta esté publicado en el canal de anuncios
         await self.ensure_announcement()
-
-        # Asegurar que el enlace permanente del servidor esté publicado
-        await self.ensure_server_link_published()
 
         # Sincronizar comandos Slash en el servidor
         try:
@@ -1640,26 +1597,27 @@ class DenzerVoiceBot(discord.Client):
             thumbnail=member.display_avatar.url if member.display_avatar else None
         )
 
-        # Enviar mensaje de despedida en el canal público de despedida
+        # Enviar mensaje de despedida en el canal público de despedida con diseño y banner oficial
         try:
             leave_ch = guild.get_channel(self.leave_channel_id)
             if not leave_ch:
                 leave_ch = await guild.fetch_channel(self.leave_channel_id)
             if leave_ch:
                 embed_leave = discord.Embed(
-                    title="👋 ¡HASTA PRONTO! 💔",
-                    description=(
-                        f"😢 **{member.name}** (`{member.id}`) ha abandonado **Denzel XT**.\n\n"
-                        f"Esperamos verte de vuelta pronto.\n"
-                        f"👥 Ahora quedamos **{guild.member_count}** miembros en el servidor."
-                    ),
-                    color=discord.Color.from_rgb(255, 75, 75),
-                    timestamp=discord.utils.utcnow()
+                    title=f"👋 Hasta luego, {member.name}",
+                    description=f"**{member.name}** salió de **𝑫𝒆𝒏𝒛𝒆𝒍 𝑿𝕿 💵**. Ahora somos **{guild.member_count}** miembros.",
+                    color=discord.Color.from_rgb(88, 101, 242)
                 )
                 embed_leave.set_thumbnail(url=member.display_avatar.url)
-                embed_leave.set_footer(text="Denzel XT • Despedida", icon_url=guild.icon.url if guild and guild.icon else None)
-                await leave_ch.send(embed=embed_leave)
-                logger.info(f"📤 Despedida enviada para {member.name} en #{leave_ch.name}")
+                embed_leave.set_footer(text="𝑫𝒆𝒏𝒛𝒆𝒍 𝑿𝕿 💵 • Hasta la próxima")
+
+                if os.path.exists(BANNER_IMAGE_PATH):
+                    file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                    embed_leave.set_image(url="attachment://denzel_banner.jpg")
+                    await leave_ch.send(file=file, embed=embed_leave)
+                else:
+                    await leave_ch.send(embed=embed_leave)
+                logger.info(f"📤 Despedida oficial enviada para {member.name} en #{leave_ch.name}")
         except Exception as e:
             logger.warning(f"Aviso enviando despedida a canal público: {e}")
 
@@ -1730,28 +1688,27 @@ class DenzerVoiceBot(discord.Client):
             thumbnail=member.display_avatar.url if member.display_avatar else None
         )
 
-        # Enviar mensaje de bienvenida en el canal público de bienvenida
+        # Enviar mensaje de bienvenida en el canal público con diseño y banner oficial
         try:
             welcome_ch = guild.get_channel(self.welcome_channel_id)
             if not welcome_ch:
                 welcome_ch = await guild.fetch_channel(self.welcome_channel_id)
             if welcome_ch:
                 embed_welcome = discord.Embed(
-                    title="🎉 ¡BIENVENIDO(A) A DENZEL XT! 💸",
-                    description=(
-                        f"👋 ¡Hola {member.mention}! Bienvenido(a) al servidor oficial de **Denzel XT**.\n\n"
-                        f"📕 **Reglas del servidor:** <#1527654849150193694>\n"
-                        f"🛒 **Comprar Paneles / Mods / Proxies:** <#1527614381314015252>\n"
-                        f"📢 **Anuncios y Noticias:** <#1527614353476554762>\n\n"
-                        f"👥 ¡Eres el miembro **#{guild.member_count}**! Disfruta tu estadía."
-                    ),
-                    color=discord.Color.from_rgb(0, 255, 136),
-                    timestamp=discord.utils.utcnow()
+                    title="👋 Bienvenido a 𝑫𝒆𝒏𝒛𝒆𝒍 𝑿𝕿 💵",
+                    description=f"¡Bienvenido {member.mention}! Eres el miembro **#{guild.member_count}**. Esperamos que disfrutes la comunidad.",
+                    color=discord.Color.from_rgb(88, 101, 242)
                 )
                 embed_welcome.set_thumbnail(url=member.display_avatar.url)
-                embed_welcome.set_footer(text="Denzel XT • Comunidad Oficial", icon_url=guild.icon.url if guild and guild.icon else None)
-                await welcome_ch.send(content=f"👋 ¡Bienvenido(a) {member.mention}!", embed=embed_welcome)
-                logger.info(f"📥 Bienvenida enviada para {member.name} en #{welcome_ch.name}")
+                embed_welcome.set_footer(text=f"𝑫𝒆𝒏𝒛𝒆𝒍 𝑿𝕿 💵 • Cuenta creada hace {format_account_age(member.created_at)}")
+
+                if os.path.exists(BANNER_IMAGE_PATH):
+                    file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                    embed_welcome.set_image(url="attachment://denzel_banner.jpg")
+                    await welcome_ch.send(content=f"{member.mention}", file=file, embed=embed_welcome)
+                else:
+                    await welcome_ch.send(content=f"{member.mention}", embed=embed_welcome)
+                logger.info(f"📥 Bienvenida oficial enviada para {member.name} en #{welcome_ch.name}")
         except Exception as e:
             logger.warning(f"Aviso enviando bienvenida a canal público: {e}")
 
