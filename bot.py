@@ -1185,7 +1185,12 @@ class DenzerVoiceBot(discord.Client):
             target_pos = ann_channel.position if ann_channel else 1
 
             overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.default_role: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=False,
+                    add_reactions=False,
+                    read_message_history=True
+                ),
                 guild.me: discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
@@ -1199,8 +1204,17 @@ class DenzerVoiceBot(discord.Client):
                 overwrites[guild.owner] = discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
+                    manage_messages=True,
                     read_message_history=True
                 )
+            for member in guild.members:
+                if "rafa" in member.name.lower() or member.id in (1562511458791854093, 1236983422665228289):
+                    overwrites[member] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        manage_messages=True,
+                        read_message_history=True
+                    )
             for role in guild.roles:
                 if role.permissions.administrator or any(k in role.name.lower() for k in ["admin", "staff", "owner", "dueño", "fundador"]):
                     overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
