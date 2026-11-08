@@ -32,6 +32,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1543395577289777202"))
 TICKET_CHANNEL_ID = int(os.getenv("TICKET_CHANNEL_ID", "1527614381314015252"))
+ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "1527614353476554762"))
 GUILD_ID = int(os.getenv("GUILD_ID", "1387608034641055785"))
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -119,6 +120,36 @@ def format_uptime(seconds: float) -> str:
     if hours > 0:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+def is_user_staff_or_owner(member: discord.Member, guild: discord.Guild) -> bool:
+    """
+    Comprueba si un usuario es Owner, Administrador o posee roles de Staff/Ventas.
+    Los compradores normales NO podrán borrar tickets.
+    """
+    if not isinstance(member, discord.Member):
+        return False
+
+    # 1. Es el dueño del servidor (Owner)
+    if guild and member.id == guild.owner_id:
+        return True
+
+    # 2. Permisos de Administrador o Gestionar Canales
+    if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
+        return True
+
+    # 3. Roles asignados de Staff, Owner, Admin, Vendedor, Moderador, Soporte
+    staff_keywords = [
+        "owner", "dueño", "dueña", "creador", "fundador",
+        "admin", "administrador", "administradora",
+        "staff", "mod", "moderador",
+        "vendedor", "vendedores", "soporte"
+    ]
+    for role in member.roles:
+        role_lower = role.name.lower()
+        if any(keyword in role_lower for keyword in staff_keywords):
+            return True
+
+    return False
 
 # ==========================================
 # 💰 PRECIOS OFICIALES DE PRODUCTOS
@@ -226,7 +257,7 @@ async def create_ticket_for_user(interaction: discord.Interaction, selected_prod
 
         # Dar acceso a roles de Vendedor / Staff si existen
         for role in guild.roles:
-            if role.name.lower() in ["vendedor", "vendedores", "staff", "soporte", "admin", "administrador"]:
+            if role.name.lower() in ["vendedor", "vendedores", "staff", "soporte", "admin", "administrador", "owner"]:
                 overwrites[role] = discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
@@ -260,7 +291,7 @@ async def create_ticket_for_user(interaction: discord.Interaction, selected_prod
         embed_ticket.add_field(name="👤 Cliente", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=True)
         embed_ticket.add_field(name="📦 Pedido", value=f"**{selected_product}**", inline=True)
         embed_ticket.set_footer(
-            text="Denzel XT • Si deseas cerrar este ticket, usa el botón rojo de abajo.",
+            text="Denzel XT • Solo miembros del Staff / Owner pueden cerrar este ticket.",
             icon_url=guild.icon.url if guild.icon else None
         )
 
@@ -409,16 +440,24 @@ class TicketPanelView(discord.ui.View):
 
 
 class TicketConfirmCloseView(discord.ui.View):
-    """Confirmación para cerrar el ticket."""
+    """Confirmación para cerrar el ticket (Solo Staff/Owner)."""
     def __init__(self):
         super().__init__(timeout=60)
 
     @discord.ui.button(label="Sí, cerrar y borrar", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Doble verificación de permisos de Staff/Owner
+        if not is_user_staff_or_owner(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "⛔ **Acceso denegado:** No tienes permisos para borrar este ticket.",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_message("🔒 **Cerrando ticket...** El canal se eliminará en 5 segundos.")
         await asyncio.sleep(5)
         try:
-            await interaction.channel.delete(reason=f"Ticket cerrado por {interaction.user.name}")
+            await interaction.channel.delete(reason=f"Ticket cerrado por {interaction.user.name} (Staff/Owner)")
         except Exception as e:
             logger.error(f"Error borrando canal de ticket: {e}")
 
@@ -428,7 +467,7 @@ class TicketConfirmCloseView(discord.ui.View):
 
 
 class TicketCloseView(discord.ui.View):
-    """Botón persistente para cerrar el ticket."""
+    """Botón persistente para cerrar el ticket con restricción de roles."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -439,6 +478,15 @@ class TicketCloseView(discord.ui.View):
         custom_id="ticket_btn_close"
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Comprobar si el usuario tiene rol de Owner, Admin o Staff
+        if not is_user_staff_or_owner(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "⛔ **Acceso Denegado:** Solo los miembros del **Staff, Vendedores, Administradores u Owners** tienen permitido cerrar este ticket.\n"
+                "Por favor espera a que el equipo termine de atenderte.",
+                ephemeral=True
+            )
+            return
+
         confirm_view = TicketConfirmCloseView()
         await interaction.response.send_message(
             "⚠️ **¿Estás seguro de que deseas cerrar y eliminar este ticket?**",
@@ -448,7 +496,7 @@ class TicketCloseView(discord.ui.View):
 
 
 # ==========================================
-# 🤖 CLASE PRINCIPAL DEL BOT (DENZER VOICE + TICKETS)
+# 🤖 CLASE PRINCIPAL DEL BOT (DENZER VOICE + TICKETS + ANUNCIOS)
 # ==========================================
 
 class DenzerVoiceBot(discord.Client):
@@ -458,6 +506,7 @@ class DenzerVoiceBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.target_channel_id = VOICE_CHANNEL_ID
         self.ticket_channel_id = TICKET_CHANNEL_ID
+        self.announcement_channel_id = ANNOUNCEMENT_CHANNEL_ID
         self.guild_id = GUILD_ID
         self.connection_lock = asyncio.Lock()
         self.audio_queue = asyncio.Queue()
@@ -519,6 +568,48 @@ class DenzerVoiceBot(discord.Client):
         )
         return embed
 
+    def create_announcement_content(self, guild: Optional[discord.Guild] = None) -> tuple[discord.Embed, discord.ui.View]:
+        """Crea el Embed y Botón de Anuncio para incentivar compras y dirigir a tickets."""
+        embed = discord.Embed(
+            title="🔥 ¡MEJORA TU NIVEL CON DENZEL XT! | PANELES, PROXIES Y MODS 💸",
+            description=(
+                "¿Quieres dominar tus partidas con la mayor seguridad y el mejor rendimiento? 🚀\n"
+                "En **Denzel XT** te ofrecemos herramientas VIP 100% optimizadas y con soporte garantizado.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🍎 **PRODUCTOS DISPONIBLES PARA iOS:**\n"
+                "• 📱 **Panel de iOS:** *Mes: $20 USD • Permanente: $50 USD*\n"
+                "• 🌐 **Proxy de iOS:** *2 Semanas: $20 USD • Mes: $35 USD • Permanente: $100 USD*\n\n"
+                "💻 **PRODUCTOS DISPONIBLES PARA PC:**\n"
+                "• 💻 **Complex de PC:** *Semana: $6 USD • Mes: $20 USD • Permanente: $55 USD*\n"
+                "• 🔥 **BR Mods:** *Semana: $6 USD • Mes: $15 USD • Permanente: $55 USD*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🛒 **¿CÓMO COMPRAR O PEDIR INFORMACIÓN?**\n"
+                f"¡Es muy fácil y rápido! Abre tu ticket de atención inmediata en:\n"
+                f"👉 <#{self.ticket_channel_id}>\n\n"
+                "1️⃣ Ve a <#" + str(self.ticket_channel_id) + ">\n"
+                "2️⃣ Selecciona tu producto en el combo desplegable.\n"
+                "3️⃣ Se creará tu canal privado donde los vendedores te darán los métodos de pago y la entrega inmediata."
+            ),
+            color=discord.Color.from_rgb(0, 255, 136)
+        )
+        embed.set_footer(
+            text="Denzel XT • Ventas oficiales • Atención Inmediata 24/7",
+            icon_url=guild.icon.url if (guild and guild.icon) else None
+        )
+
+        # Botón directo que conduce al canal de tickets
+        view = discord.ui.View()
+        channel_url = f"https://discord.com/channels/{self.guild_id}/{self.ticket_channel_id}"
+        view.add_item(
+            discord.ui.Button(
+                label="🎫 Comprar / Abrir Ticket Aquí",
+                url=channel_url,
+                style=discord.ButtonStyle.link,
+                emoji="🛒"
+            )
+        )
+        return embed, view
+
     async def ensure_ticket_panel(self):
         """Verifica si el panel de tickets ya está publicado en el canal asignado; si no, lo envía o actualiza."""
         try:
@@ -536,7 +627,6 @@ class DenzerVoiceBot(discord.Client):
                     for emb in msg.embeds:
                         if emb.title and "Sistema de Tickets" in emb.title:
                             panel_found = True
-                            # Actualizar mensaje con el nuevo Embed con precios y vista limpia de combos
                             try:
                                 await msg.edit(
                                     embed=self.create_ticket_panel_embed(channel.guild),
@@ -556,6 +646,40 @@ class DenzerVoiceBot(discord.Client):
                 logger.info(f"📨 Panel de tickets enviado exitosamente al canal #{channel.name} ({channel.id}).")
         except Exception as e:
             logger.error(f"❌ Error al revisar/enviar panel de tickets: {e}")
+
+    async def ensure_announcement(self):
+        """Verifica si el mensaje de venta/anuncio ya está publicado en el canal de anuncios; si no, lo envía o actualiza."""
+        try:
+            channel = self.get_channel(self.announcement_channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.announcement_channel_id)
+                except Exception as e:
+                    logger.warning(f"⚠️ No se pudo acceder al canal de anuncios (ID: {self.announcement_channel_id}): {e}")
+                    return
+
+            announcement_found = False
+            async for msg in channel.history(limit=25):
+                if msg.author.id == self.user.id and msg.embeds:
+                    for emb in msg.embeds:
+                        if emb.title and "MEJORA TU NIVEL CON DENZEL XT" in emb.title:
+                            announcement_found = True
+                            try:
+                                embed, view = self.create_announcement_content(channel.guild)
+                                await msg.edit(embed=embed, view=view)
+                                logger.info(f"📢 Anuncio de venta en #{channel.name} (ID: {msg.id}) actualizado correctamente.")
+                            except Exception as e:
+                                logger.warning(f"Aviso actualizando anuncio: {e}")
+                            break
+                if announcement_found:
+                    break
+
+            if not announcement_found:
+                embed, view = self.create_announcement_content(channel.guild)
+                await channel.send(embed=embed, view=view)
+                logger.info(f"📨 Anuncio oficial de compra publicado exitosamente en #{channel.name} ({channel.id}).")
+        except Exception as e:
+            logger.error(f"❌ Error al revisar/publicar anuncio: {e}")
 
     def setup_slash_commands(self):
         @self.tree.command(name="tts", description="Lee tu mensaje en voz alta en el canal de voz para los que no tienen mic")
@@ -586,6 +710,15 @@ class DenzerVoiceBot(discord.Client):
             await target.send(embed=embed, view=view)
             await interaction.response.send_message(f"✅ Panel de tickets publicado en {target.mention}.", ephemeral=True)
 
+        @self.tree.command(name="enviar_anuncio", description="Publica el anuncio de venta de paneles y mods en el canal de anuncios")
+        @app_commands.describe(canal="Canal donde publicar el anuncio (opcional, por defecto el canal de anuncios)")
+        @app_commands.default_permissions(administrator=True)
+        async def announcement_cmd(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+            target = canal or self.get_channel(self.announcement_channel_id) or interaction.channel
+            embed, view = self.create_announcement_content(interaction.guild)
+            await target.send(embed=embed, view=view)
+            await interaction.response.send_message(f"✅ Anuncio de compra publicado con éxito en {target.mention}.", ephemeral=True)
+
     async def start_cloud_health_server(self):
         """Servidor HTTP liviano para Railway/Render."""
         try:
@@ -610,7 +743,9 @@ class DenzerVoiceBot(discord.Client):
         logger.info(f"🟢 BOT EN LÍNEA: {self.user.name} ({self.user.id})")
         logger.info(f"🔊 Canal de Voz Objetivo: {self.target_channel_id}")
         logger.info(f"🎫 Canal de Tickets Objetivo: {self.ticket_channel_id}")
+        logger.info(f"📢 Canal de Anuncios: {self.announcement_channel_id}")
         logger.info("🛒 Sistema de Tickets de Compra con Precios: Activo")
+        logger.info("🔒 Restricción de Cierre de Tickets (Solo Staff/Owner): Activo")
         logger.info("=" * 65)
 
         # Iniciar servidor web de salud para Railway si aplica
@@ -619,12 +754,15 @@ class DenzerVoiceBot(discord.Client):
         # Asegurar que el panel de tickets esté publicado y actualizado con los precios
         await self.ensure_ticket_panel()
 
+        # Asegurar que el anuncio de venta esté publicado en el canal de anuncios
+        await self.ensure_announcement()
+
         # Sincronizar comandos Slash en el servidor
         try:
             guild_obj = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild_obj)
             await self.tree.sync(guild=guild_obj)
-            logger.info("⚡ Comandos Slash sincronizados.")
+            logger.info("⚡ Comandos Slash sincronizados (/tts, /panel_tickets, /enviar_anuncio).")
         except Exception as e:
             logger.warning(f"Aviso al sincronizar slash commands: {e}")
 
@@ -753,7 +891,7 @@ class DenzerVoiceBot(discord.Client):
         if message.author.bot or message.author.id == self.user.id:
             return
 
-        if message.channel.id == self.ticket_channel_id:
+        if message.channel.id in (self.ticket_channel_id, self.announcement_channel_id):
             return
         if hasattr(message.channel, "name") and message.channel.name.startswith("ticket-"):
             return
