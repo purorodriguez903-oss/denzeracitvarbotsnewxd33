@@ -1131,6 +1131,106 @@ class TicketCloseView(discord.ui.View):
 
 
 # ==========================================
+# 🎁 PANEL OFICIAL DE KEYS GRATIS Y RECOMPENSAS
+# ==========================================
+
+class FreeKeysPanelView(discord.ui.View):
+    """Botones interactivos en el canal de Keys Gratis para consultar invitaciones y reclamar."""
+    def __init__(self, ticket_channel_id: int = TICKET_CHANNEL_ID, guild_id: int = GUILD_ID):
+        super().__init__(timeout=None)
+        self.ticket_channel_id = ticket_channel_id
+        self.guild_id = guild_id
+
+        # Botón para consultar las invitaciones propias
+        self.btn_my_invites = discord.ui.Button(
+            label="🎟️ Mis Invitaciones",
+            style=discord.ButtonStyle.success,
+            custom_id="keys_panel_my_invites",
+            row=0
+        )
+        self.btn_my_invites.callback = self.my_invites_callback
+        self.add_item(self.btn_my_invites)
+
+        # Botón para ver el Top 10 del servidor
+        self.btn_top = discord.ui.Button(
+            label="🏆 Top Invitadores",
+            style=discord.ButtonStyle.secondary,
+            custom_id="keys_panel_top_invites",
+            row=0
+        )
+        self.btn_top.callback = self.top_callback
+        self.add_item(self.btn_top)
+
+        # Botón directo para reclamar abriendo ticket
+        channel_url = f"https://discord.com/channels/{guild_id}/{ticket_channel_id}"
+        self.btn_ticket = discord.ui.Button(
+            label="🎫 Reclamar Key en Ticket",
+            url=channel_url,
+            style=discord.ButtonStyle.link,
+            emoji="🎁",
+            row=0
+        )
+        self.add_item(self.btn_ticket)
+
+    async def my_invites_callback(self, interaction: discord.Interaction):
+        bot_client = interaction.client
+        stats = bot_client.invite_manager.get_stats(interaction.user.id)
+        total = stats.get("total", 0)
+        active = stats.get("active", 0)
+        leaves = stats.get("leaves", 0)
+
+        falta = max(0, 5 - active)
+        if falta == 0:
+            progreso_txt = f"🎉 **¡Felicidades! Ya tienes {active} invitaciones activas.** Abre un ticket en <#{self.ticket_channel_id}> para reclamar tu Key de 1 Día de BR Mods."
+        else:
+            progreso_txt = f"⏳ Llevas **{active}/5 invitaciones activas**. Te faltan **{falta}** para tu **Key de 1 Día de BR Mods**."
+
+        embed = discord.Embed(
+            title="🎟️ Tus Estadísticas de Invitación",
+            description=(
+                f"👤 **Usuario:** {interaction.user.mention}\n\n"
+                f"📈 **Total Invitados:** **{total} personas**\n"
+                f"✅ **Miembros Activos:** **{active} personas**\n"
+                f"🚪 **Han salido:** **{leaves} personas**\n\n"
+                f"{progreso_txt}\n\n"
+                f"🔗 **Comparte tu enlace de invitación:**\n"
+                f"Invita amigos a {PERMANENT_INVITE_URL} para seguir acumulando recompensas."
+            ),
+            color=discord.Color.from_rgb(0, 230, 118)
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def top_callback(self, interaction: discord.Interaction):
+        bot_client = interaction.client
+        top_list = bot_client.invite_manager.get_top_inviters(limit=10)
+        guild = interaction.guild
+
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        lines = []
+        for i, (uid, stats) in enumerate(top_list):
+            medal = medals[i] if i < len(medals) else f"`#{i+1}`"
+            user = guild.get_member(uid) if guild else None
+            name_str = user.mention if user else f"`ID {uid}`"
+            act = stats.get("active", 0)
+            tot = stats.get("total", 0)
+            lines.append(f"{medal} {name_str} — **{act} activos** *(Total: {tot})*")
+
+        if not lines:
+            lines.append("Aún no hay invitaciones registradas en el nuevo sistema.")
+
+        embed = discord.Embed(
+            title="🏆 TOP 10 INVITADORES DEL SERVIDOR 🏆",
+            description=(
+                "¡Los miembros con más personas invitadas a **Denzel XT**!\n\n"
+                + "\n".join(lines) + "\n\n"
+                f"👉 ¡Invita a tus amigos y gana keys gratuitas semanales!"
+            ),
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==========================================
 # 🔐 SISTEMA DE AUTORIZACIÓN DE BOTS (ANTI-RAID CON PASSWORD)
 # ==========================================
 
@@ -1321,7 +1421,8 @@ class DenzerVoiceBot(discord.Client):
         """Registra vistas persistentes de Discord antes de iniciar eventos."""
         self.add_view(TicketPanelView())
         self.add_view(TicketCloseView())
-        logger.info("🧩 Vistas persistentes del Sistema de Tickets registradas correctamente.")
+        self.add_view(FreeKeysPanelView())
+        logger.info("🧩 Vistas persistentes del Sistema de Tickets y Keys registradas correctamente.")
 
     async def on_interaction(self, interaction: discord.Interaction):
         """Monitoreo de interacciones en tiempo real y fallback de botones persistentes."""
@@ -1353,6 +1454,62 @@ class DenzerVoiceBot(discord.Client):
                         default_prod = topic.split("Producto:")[-1].strip()
                 modal = ReviewModal(default_product=default_prod)
                 await interaction.response.send_modal(modal)
+                return
+
+            # 3. BOTONES DEL PANEL DE KEYS GRATIS Y RECOMPENSAS
+            elif custom_id == "keys_panel_my_invites":
+                stats = self.invite_manager.get_stats(interaction.user.id)
+                total = stats.get("total", 0)
+                active = stats.get("active", 0)
+                leaves = stats.get("leaves", 0)
+                falta = max(0, 5 - active)
+                if falta == 0:
+                    progreso_txt = f"🎉 **¡Felicidades! Ya tienes {active} invitaciones activas.** Abre un ticket en <#{self.ticket_channel_id}> para reclamar tu Key de 1 Día de BR Mods."
+                else:
+                    progreso_txt = f"⏳ Llevas **{active}/5 invitaciones activas**. Te faltan **{falta}** para tu **Key de 1 Día de BR Mods**."
+
+                embed = discord.Embed(
+                    title="🎟️ Tus Estadísticas de Invitación",
+                    description=(
+                        f"👤 **Usuario:** {interaction.user.mention}\n\n"
+                        f"📈 **Total Invitados:** **{total} personas**\n"
+                        f"✅ **Miembros Activos:** **{active} personas**\n"
+                        f"🚪 **Han salido:** **{leaves} personas**\n\n"
+                        f"{progreso_txt}\n\n"
+                        f"🔗 **Comparte tu enlace de invitación:**\n"
+                        f"Invita amigos a {self.permanent_invite_url} para seguir acumulando recompensas."
+                    ),
+                    color=discord.Color.from_rgb(0, 230, 118)
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            elif custom_id == "keys_panel_top_invites":
+                top_list = self.invite_manager.get_top_inviters(limit=10)
+                guild = interaction.guild
+                medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+                lines = []
+                for i, (uid, stats) in enumerate(top_list):
+                    medal = medals[i] if i < len(medals) else f"`#{i+1}`"
+                    user = guild.get_member(uid) if guild else None
+                    name_str = user.mention if user else f"`ID {uid}`"
+                    act = stats.get("active", 0)
+                    tot = stats.get("total", 0)
+                    lines.append(f"{medal} {name_str} — **{act} activos** *(Total: {tot})*")
+
+                if not lines:
+                    lines.append("Aún no hay invitaciones registradas en el nuevo sistema.")
+
+                embed = discord.Embed(
+                    title="🏆 TOP 10 INVITADORES DEL SERVIDOR 🏆",
+                    description=(
+                        "¡Los miembros con más personas invitadas a **Denzel XT**!\n\n"
+                        + "\n".join(lines) + "\n\n"
+                        f"👉 ¡Invita a tus amigos y gana keys gratuitas semanales!"
+                    ),
+                    color=discord.Color.gold()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
             # 3. VERIFICACIÓN Y AUTORIZACIÓN DE BOTS
@@ -1576,6 +1733,81 @@ class DenzerVoiceBot(discord.Client):
         except Exception as e:
             logger.error(f"❌ Error al revisar/publicar anuncio: {e}")
 
+    def create_free_keys_panel_content(self, guild: Optional[discord.Guild] = None) -> tuple[discord.Embed, discord.ui.View]:
+        """Crea el Embed y Botones para el canal de Keys Gratis y Recompensas por Invites."""
+        embed = discord.Embed(
+            title="🎁 KEYS GRATIS & RECOMPENSAS POR INVITACIONES • DENZEL XT 💸",
+            description=(
+                "¡En **Denzel XT** premiamos a nuestra comunidad con **Keys 100% Gratis de BR Mods**, paneles y descuentos exclusivos! 🔥\n\n"
+                "Hay dos formas automáticas y 100% seguras de conseguir keys sin pagar nada:\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🎉 **1. SORTEOS AUTOMÁTICOS DE KEYS:**\n"
+                "• El Staff y el bot publican periódicamente sorteos en este mismo canal.\n"
+                "• Cada vez que veas un sorteo activo, presiona el botón verde **🎉 Participar**.\n"
+                "• El bot seleccionará a los ganadores al azar de forma 100% transparente.\n\n"
+                "🎟️ **2. PROGRAMA DE RECOMPENSAS POR INVITAR:**\n"
+                "¡Invita a tus amigos al servidor con tu link y gana premios inmediatos!\n"
+                "• 🎁 **5 Invitaciones activas:** Key de **1 Día de BR Mods** GRATIS.\n"
+                "• 💎 **10 Invitaciones activas:** Descuento del **20%** en cualquier Panel VIP.\n"
+                "• 🚀 **20 Invitaciones activas:** Key **Semanal Completa** de Complex PC o BR Mods.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📌 **¿CÓMO RECLAMAR TU KEY?**\n"
+                f"1️⃣ Comparte tu enlace de invitación o el permanente: {self.permanent_invite_url}\n"
+                "2️⃣ Presiona el botón **🎟️ Mis Invitaciones** abajo para verificar cuántos amigos llevas.\n"
+                f"3️⃣ Cuando llegues a 5 o más, abre un ticket en <#{self.ticket_channel_id}> y el staff te entregará tu key."
+            ),
+            color=discord.Color.from_rgb(0, 255, 170)
+        )
+        embed.set_footer(
+            text="Denzel XT • Keys y Sorteos Oficiales • 100% Transparentes",
+            icon_url=guild.icon.url if (guild and guild.icon) else None
+        )
+
+        view = FreeKeysPanelView(ticket_channel_id=self.ticket_channel_id, guild_id=self.guild_id)
+        return embed, view
+
+    async def ensure_free_keys_panel(self):
+        """Verifica si el panel de keys gratis e invites está publicado en el canal asignado; si no, lo envía o actualiza."""
+        try:
+            target_id = self.free_keys_channel_id
+            channel = self.get_channel(target_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(target_id)
+                except Exception as e:
+                    logger.warning(f"⚠️ No se pudo acceder al canal de keys (ID: {target_id}): {e}")
+                    return
+
+            panel_found = False
+            async for msg in channel.history(limit=25):
+                if msg.author.id == self.user.id and msg.embeds:
+                    for emb in msg.embeds:
+                        if emb.title and "KEYS GRATIS & RECOMPENSAS" in emb.title:
+                            panel_found = True
+                            try:
+                                embed, view = self.create_free_keys_panel_content(channel.guild)
+                                if os.path.exists(BANNER_IMAGE_PATH):
+                                    embed.set_image(url="attachment://denzel_banner.jpg")
+                                await msg.edit(embed=embed, view=view)
+                                logger.info(f"🎁 Panel de Keys Gratis en #{channel.name} (ID: {msg.id}) actualizado correctamente.")
+                            except Exception as e:
+                                logger.warning(f"Aviso actualizando panel de keys: {e}")
+                            break
+                if panel_found:
+                    break
+
+            if not panel_found:
+                embed, view = self.create_free_keys_panel_content(channel.guild)
+                if os.path.exists(BANNER_IMAGE_PATH):
+                    file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                    embed.set_image(url="attachment://denzel_banner.jpg")
+                    await channel.send(file=file, embed=embed, view=view)
+                else:
+                    await channel.send(embed=embed, view=view)
+                logger.info(f"📨 Panel oficial de Keys Gratis publicado exitosamente en #{channel.name} ({channel.id}).")
+        except Exception as e:
+            logger.error(f"❌ Error al revisar/publicar panel de keys: {e}")
+
     def setup_slash_commands(self):
         @self.tree.command(name="tts", description="Lee tu mensaje en voz alta en el canal de voz para los que no tienen mic")
         @app_commands.describe(mensaje="El texto que quieres que la voz latina diga en la llamada")
@@ -1604,6 +1836,20 @@ class DenzerVoiceBot(discord.Client):
             view = TicketPanelView()
             await target.send(embed=embed, view=view)
             await interaction.response.send_message(f"✅ Panel de tickets publicado en {target.mention}.", ephemeral=True)
+
+        @self.tree.command(name="panel_keys", description="Publica el panel oficial de keys gratis y recompensas por invites")
+        @app_commands.describe(canal="Canal donde publicar el panel (opcional, por defecto el canal de Keys Gratis)")
+        @app_commands.default_permissions(administrator=True)
+        async def panel_keys_cmd(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+            target = canal or self.get_channel(self.free_keys_channel_id) or interaction.channel
+            embed, view = self.create_free_keys_panel_content(interaction.guild)
+            if os.path.exists(BANNER_IMAGE_PATH):
+                file = discord.File(BANNER_IMAGE_PATH, filename="denzel_banner.jpg")
+                embed.set_image(url="attachment://denzel_banner.jpg")
+                await target.send(file=file, embed=embed, view=view)
+            else:
+                await target.send(embed=embed, view=view)
+            await interaction.response.send_message(f"✅ Panel de Keys Gratis publicado en {target.mention}.", ephemeral=True)
 
         @self.tree.command(name="enviar_anuncio", description="Publica el anuncio de venta de paneles y mods en el canal de anuncios")
         @app_commands.describe(canal="Canal donde publicar el anuncio (opcional, por defecto el canal de anuncios)")
@@ -2084,12 +2330,15 @@ class DenzerVoiceBot(discord.Client):
         # Asegurar que el anuncio de venta esté publicado en el canal de anuncios
         await self.ensure_announcement()
 
+        # Asegurar que el panel de keys gratis e invites esté publicado en el canal de keys
+        await self.ensure_free_keys_panel()
+
         # Sincronizar comandos Slash en el servidor
         try:
             guild_obj = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild_obj)
             await self.tree.sync(guild=guild_obj)
-            logger.info("⚡ Comandos Slash sincronizados (/tts, /panel_tickets, /enviar_anuncio, /pagos, /referencia, /entregar, /invites, /top_invites, /sorteo, /alerta_live).")
+            logger.info("⚡ Comandos Slash sincronizados (/tts, /panel_tickets, /panel_keys, /enviar_anuncio, /pagos, /referencia, /entregar, /invites, /top_invites, /sorteo, /alerta_live).")
         except Exception as e:
             logger.warning(f"Aviso al sincronizar slash commands: {e}")
 
