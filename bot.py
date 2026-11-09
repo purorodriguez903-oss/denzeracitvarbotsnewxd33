@@ -147,16 +147,16 @@ os.makedirs(AUDIO_TEMP_DIR, exist_ok=True)
 # Candado de instancia única local para evitar que se ejecuten 2 bots en la misma máquina
 SINGLE_INSTANCE_SOCKET = None
 def ensure_single_local_instance(port: int = 49152):
-    """Garantiza que solo una instancia del bot corra en esta máquina."""
+    """Garantiza que solo una instancia del bot corra en esta máquina local."""
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID") or os.getenv("PORT"):
+        return
     global SINGLE_INSTANCE_SOCKET
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(('127.0.0.1', port))
         SINGLE_INSTANCE_SOCKET = s
-    except OSError:
-        logger.error("❌ ERROR: Ya hay otra instancia de DenzerBot ejecutándose en esta PC.")
-        logger.error("   Cierra la otra ventana o ejecuta detener_bot.bat antes de iniciar.")
-        sys.exit(1)
+    except Exception as e:
+        logger.warning(f"Aviso single-instance check: {e}")
 
 def extract_natural_name(member: discord.Member) -> str:
     """
@@ -1424,6 +1424,9 @@ class DenzerVoiceBot(discord.Client):
         self.add_view(FreeKeysPanelView())
         logger.info("🧩 Vistas persistentes del Sistema de Tickets y Keys registradas correctamente.")
 
+        # Iniciar servidor de salud HTTP de inmediato para Railway
+        await self.start_cloud_health_server()
+
     async def on_interaction(self, interaction: discord.Interaction):
         """Monitoreo de interacciones en tiempo real y fallback de botones persistentes."""
         logger.info(f"📥 Interacción recibida | Usuario: {interaction.user.name} | Tipo: {interaction.type.name}")
@@ -2273,6 +2276,9 @@ class DenzerVoiceBot(discord.Client):
 
     async def start_cloud_health_server(self):
         """Servidor HTTP liviano para Railway/Render."""
+        if getattr(self, "_health_server_started", False):
+            return
+        self._health_server_started = True
         try:
             app = web.Application()
             async def handle_ping(request):
@@ -3363,7 +3369,9 @@ def run_bot():
     ensure_single_local_instance()
 
     if not TOKEN:
-        logger.error("❌ ERROR: DISCORD_TOKEN no configurado en .env")
+        logger.error("❌ ERROR: DISCORD_TOKEN no configurado.")
+        logger.error("👉 En Railway: Ve a la pestaña 'Variables' y agrega todas las variables de tu archivo .env.")
+        time.sleep(15)
         sys.exit(1)
 
     try:
